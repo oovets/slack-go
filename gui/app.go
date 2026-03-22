@@ -2190,11 +2190,12 @@ func (p *chatPane) refreshForTheme() {
 
 func (p *chatPane) setMessages(msgs []api.Message, currentUserID, selfUserID string, onThread func(api.Message), onReply func(api.Message), onMedia func(api.File)) {
 	p.msgBox.Objects = nil
+	inThreadView := strings.TrimSpace(p.threadTS) != ""
 	for i, m := range msgs {
 		showHeader := isLastInSenderGroup(msgs, i)
 		isFromMe := strings.TrimSpace(m.UserID) != "" && strings.TrimSpace(m.UserID) == strings.TrimSpace(currentUserID)
 		mentionedMe := messageMentionsUser(m.Text, selfUserID)
-		p.msgBox.Add(renderMessageRow(m, isFromMe, mentionedMe, onThread, onReply, onMedia, showHeader))
+		p.msgBox.Add(renderMessageRow(m, isFromMe, mentionedMe, onThread, onReply, onMedia, showHeader, inThreadView))
 	}
 	p.msgBox.Refresh()
 	for _, d := range []time.Duration{0, 60 * time.Millisecond, 200 * time.Millisecond, 500 * time.Millisecond, 900 * time.Millisecond, 1400 * time.Millisecond} {
@@ -2209,11 +2210,18 @@ func (p *chatPane) setMessages(msgs []api.Message, currentUserID, selfUserID str
 	}
 }
 
-func renderMessageRow(m api.Message, isFromMe bool, mentionedMe bool, onThread func(api.Message), onReply func(api.Message), onMedia func(api.File), showHeader bool) fyne.CanvasObject {
+func renderMessageRow(m api.Message, isFromMe bool, mentionedMe bool, onThread func(api.Message), onReply func(api.Message), onMedia func(api.File), showHeader bool, inThreadView bool) fyne.CanvasObject {
 	name := senderName(m)
 	ts := canvas.NewText(formatHoverTimestamp(m.Time)+" ", color.NRGBA{R: 100, G: 106, B: 130, A: 0})
 	ts.TextSize = hoverTimestampTextSize()
-	hint := canvas.NewText("open thread", color.NRGBA{R: 100, G: 106, B: 130, A: 0})
+	hintText := "reply in thread"
+	if m.ReplyCount > 0 {
+		hintText = "view thread"
+	}
+	if inThreadView {
+		hintText = ""
+	}
+	hint := canvas.NewText(hintText, color.NRGBA{R: 100, G: 106, B: 130, A: 0})
 	hint.TextSize = hoverTimestampTextSize()
 
 	body := widget.NewLabel(m.Text)
@@ -2241,10 +2249,19 @@ func renderMessageRow(m api.Message, isFromMe bool, mentionedMe bool, onThread f
 	}
 	rowWithMeta.Add(row)
 	openThread := func() {
+		if inThreadView {
+			return
+		}
 		if onThread == nil {
 			return
 		}
 		onThread(m)
+	}
+	if !inThreadView && m.ReplyCount > 0 {
+		threadLabel := fmt.Sprintf("🧵 %d repl%s · View thread", m.ReplyCount, pluralSuffix(m.ReplyCount))
+		threadBtn := widget.NewButton(threadLabel, openThread)
+		threadBtn.Importance = widget.LowImportance
+		rowWithMeta.Add(alignOutgoingRow(threadBtn, isFromMe))
 	}
 
 	var content *fyne.Container
@@ -2290,6 +2307,13 @@ func renderMessageRow(m api.Message, isFromMe bool, mentionedMe bool, onThread f
 		return container.NewMax(bg, rowCanvas)
 	}
 	return rowCanvas
+}
+
+func pluralSuffix(n int) string {
+	if n == 1 {
+		return "y"
+	}
+	return "ies"
 }
 
 func senderName(m api.Message) string {
