@@ -55,6 +55,15 @@ Logs are written to `~/.slack-gui.log`.
 - Realtime updates (Socket Mode with RTM fallback)
 - Persistent UI state (window size, layout, view preferences)
 
+## Resource Comparison
+
+Test window: 30s (warmup 5s, interval 1s)
+
+| App | Avg CPU % | Avg RAM (MiB) | Peak RAM (MiB) | Samples |
+|---|---:|---:|---:|---:|
+| Slack GO | 44.82 | 249.4 | 265.6 | 30 |
+| Slack Desktop | 91.47 | 1327.8 | 1498.4 | 30 |
+
 ## Keyboard Shortcuts
 
 - `Ctrl+H` split focused pane horizontally
