@@ -1,43 +1,43 @@
 # Slack GUI
 
-Detta är ett fristående projekt för Slack GUI (utbrutet från `bluebubbles-tui`).
+Standalone Slack desktop client built with Go and Fyne.
 
-- `api` — Slack API-klient (channels, messages, threads, replies, media)
-- `gui` — Fyne-baserad GUI med split panes och sticky focus
-- `cmd/slack-gui` — binär entrypoint
+## Project Layout
 
-## Krav
+- `api` - Slack API client (channels, history, threads, media)
+- `gui` - Fyne UI (pane layout, message rendering, realtime updates)
+- `cmd/slack-gui` - executable entrypoint
+
+## Requirements
 
 - Go 1.24+
-- En Slack bot-token med scopes för kanaler, historik, postning och users-listning
+- Slack token with scopes for conversations, history, posting, and users
 
-## Konfiguration
+## Configuration
 
-Slack GUI kan använda samma credentials-filformat som `slack_rust` (`slack_config.json` med `workspaces` + `active_workspace`).
-
-Prioritet för token:
+Credential priority:
 
 1. `SLACK_BOT_TOKEN`
 2. `SLACK_TOKEN`
-3. `slack_config.json` (sökvägar nedan)
+3. `slack_config.json`
+
+Optional environment variables:
 
 ```bash
 export SLACK_BOT_TOKEN="xoxb-..."
-# Valfritt:
-export SLACK_API_BASE_URL="https://slack.com/api"
-# Om config-filen ligger på annan plats:
-export SLACK_CONFIG_PATH="/path/to/slack_config.json"
+export SLACK_APP_TOKEN="xapp-..." # optional, enables Socket Mode
+export SLACK_API_BASE_URL="https://slack.com/api" # optional
+export SLACK_CONFIG_PATH="/path/to/slack_config.json" # optional
 ```
 
-Automatiskt sökta config-paths:
+Auto-discovered config locations:
 
 - `~/.config/slack_rust/slack_config.json`
 - `~/.config/slack/slack_config.json`
 - `~/Code/slack_rust/config/slack_config.json`
-- `<repo>/config/slack_config.json`
-- `<repo>/../slack_rust/config/slack_config.json`
+- `config/slack_config.json`
 
-## Build + Run
+## Build and Run
 
 ```bash
 go mod tidy
@@ -45,37 +45,21 @@ go build -o slack-gui ./cmd/slack-gui
 ./slack-gui
 ```
 
-Logg skrivs till `~/.slack-gui.log`.
+Logs are written to `~/.slack-gui.log`.
 
-## Nytt Repo
+## Key Features
 
-```bash
-cd /home/stefan/Code/slack-gui
-git init
-git add .
-git commit -m "Initial standalone Slack GUI project"
-# skapa repo på GitHub, sen:
-git remote add origin <your-new-repo-url>
-git branch -M main
-git push -u origin main
-```
+- Channel list with search and unread indicators
+- Multi-pane layout (horizontal/vertical split)
+- Threads and inline replies
+- Media/file links and image previews
+- Realtime updates (Socket Mode with RTM fallback)
+- Persistent UI state (window size, layout, view preferences)
 
-## Funktioner
+## Keyboard Shortcuts
 
-- Kanal-lista + filter
-- Split panes (horisontell/vertikal)
-- Sticky focus per pane
-- Threads (`🧵`)
-- Replies (`↩`) med reply-target i input
-- Media/file-rader och bildförhandsvisning
-- Persistens av fönsterstorlek, compact mode, channel-list och split-layout
-
-## Shortcuts
-
-| Key | Action |
-|-----|--------|
-| `Ctrl+H` | Split focused pane side by side |
-| `Ctrl+J` | Split focused pane top/bottom |
-| `Ctrl+W` | Close focused pane |
-| `Ctrl+S` | Toggle channel list |
-| `Ctrl+N` | New window |
+- `Ctrl+H` split focused pane horizontally
+- `Ctrl+J` split focused pane vertically
+- `Ctrl+W` close focused pane
+- `Ctrl+S` toggle channel list
+- `Ctrl+N` open new window
