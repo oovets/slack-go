@@ -6,7 +6,6 @@ Standalone Slack desktop client built with Go and Fyne.
 
 - `api` - Slack API client (channels, history, threads, media)
 - `gui` - Fyne UI (pane layout, message rendering, realtime updates)
-- `cmd/slack-gui` - executable entrypoint
 
 ## Requirements
 
