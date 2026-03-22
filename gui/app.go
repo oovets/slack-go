@@ -2258,10 +2258,8 @@ func renderMessageRow(m api.Message, isFromMe bool, mentionedMe bool, onThread f
 		onThread(m)
 	}
 	if !inThreadView && m.ReplyCount > 0 {
-		threadLabel := fmt.Sprintf("🧵 %d repl%s · View thread", m.ReplyCount, pluralSuffix(m.ReplyCount))
-		threadBtn := widget.NewButton(threadLabel, openThread)
-		threadBtn.Importance = widget.LowImportance
-		rowWithMeta.Add(alignOutgoingRow(threadBtn, isFromMe))
+		threadLabel := fmt.Sprintf("%d repl%s · View thread", m.ReplyCount, pluralSuffix(m.ReplyCount))
+		rowWithMeta.Add(alignOutgoingRow(newSubtleTapLabel(threadLabel, openThread), isFromMe))
 	}
 
 	var content *fyne.Container
@@ -2287,11 +2285,11 @@ func renderMessageRow(m api.Message, isFromMe bool, mentionedMe bool, onThread f
 		}
 		if f.IsImage() && strings.TrimSpace(f.BestImageURL()) != "" {
 			rowWithMeta.Add(widget.NewHyperlink(name, mustParseURL(f.BestImageURL())))
-			rowWithMeta.Add(widget.NewButton("Open image", func() {
+			rowWithMeta.Add(alignOutgoingRow(newSubtleTapLabel("Open image", func() {
 				if onMedia != nil {
 					onMedia(ff)
 				}
-			}))
+			}), isFromMe))
 			continue
 		}
 		if strings.TrimSpace(f.Permalink) != "" {
@@ -2386,6 +2384,15 @@ func hoverTimestampTextSize() float32 {
 	return size
 }
 
+// messageMetaActionTextSize is for inline chat actions (e.g. view thread, open image) — smaller than body text.
+func messageMetaActionTextSize() float32 {
+	size := hoverTimestampTextSize() - 1
+	if size < 8 {
+		size = 8
+	}
+	return size
+}
+
 func formatHoverTimestamp(t time.Time) string {
 	return t.Format("15:04")
 }
@@ -2444,6 +2451,45 @@ func mustParseURL(raw string) *url.URL {
 		u, _ = url.Parse("https://slack.com")
 	}
 	return u
+}
+
+// subtleTapLabel is muted, small text that reads as metadata but behaves as a tap target (no button chrome).
+type subtleTapLabel struct {
+	widget.BaseWidget
+	text  *canvas.Text
+	onTap func()
+}
+
+func newSubtleTapLabel(label string, onTap func()) *subtleTapLabel {
+	t := &subtleTapLabel{
+		text:  canvas.NewText(label, color.NRGBA{R: 95, G: 100, B: 122, A: 210}),
+		onTap: onTap,
+	}
+	t.text.TextSize = messageMetaActionTextSize()
+	t.text.TextStyle = fyne.TextStyle{}
+	t.ExtendBaseWidget(t)
+	return t
+}
+
+func (t *subtleTapLabel) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(t.text)
+}
+
+func (t *subtleTapLabel) MinSize() fyne.Size {
+	s := fyne.MeasureText(t.text.Text, t.text.TextSize, t.text.TextStyle)
+	return fyne.NewSize(s.Width+4, s.Height+2)
+}
+
+func (t *subtleTapLabel) Tapped(_ *fyne.PointEvent) {
+	if t.onTap != nil {
+		t.onTap()
+	}
+}
+
+func (t *subtleTapLabel) TappedSecondary(_ *fyne.PointEvent) {}
+
+func (t *subtleTapLabel) Cursor() desktop.Cursor {
+	return desktop.PointerCursor
 }
 
 type paneSurface struct {
