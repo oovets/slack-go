@@ -2,21 +2,16 @@ package gui
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"image"
-	"image/color"
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
 	"log"
-	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,15 +22,13 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/driver/desktop"
-	"fyne.io/fyne/v2/layout"
-	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/stefan/slack-gui/api"
-	"github.com/gorilla/websocket"
 )
 
 const appID = "com.bluebubbles-tui.slackgui"
 
+// Preference keys for persistent UI state.
 const (
 	prefShowChatList    = "ui.show_chat_list"
 	prefCompactMode     = "ui.compact_mode"
@@ -49,6 +42,7 @@ const (
 	prefPaneSeparators  = "ui.pane_separators"
 )
 
+// Section keys for the sidebar channel list.
 const (
 	sectionNew     = "new"
 	sectionThreads = "threads"
@@ -58,8 +52,26 @@ const (
 	sectionBots    = "bots"
 )
 
-var paneIDCounter int
+// Timing constants for scroll-to-bottom retries after layout changes.
+// Multiple attempts are needed because Fyne lays out widgets asynchronously.
+const (
+	reloadDebounce       = 250 * time.Millisecond
+	realtimeStartupDelay = 700 * time.Millisecond
+	postSendRefreshDelay = 130 * time.Millisecond
+)
 
+// Image preview window dimensions.
+const (
+	imagePreviewMinWidth  = float32(560)
+	imagePreviewMinHeight = float32(420)
+	imageWindowWidth      = float32(700)
+	imageWindowHeight     = float32(520)
+)
+
+// App is the top-level application controller. All fields are accessed only
+// from the Fyne main goroutine (via fyne.Do) except paneReloadMu/paneReloadTimers
+// which are protected by paneReloadMu, and realtimeStop/realtimeStopOnce which
+// are written once before the goroutine starts.
 type App struct {
 	client       *api.Client
 	info         *api.AuthInfo
@@ -72,6 +84,7 @@ type App struct {
 
 	realtimeStop     chan struct{}
 	realtimeStopOnce sync.Once
+	// paneReloadMu protects paneReloadTimers, which is written from timer goroutines.
 	paneReloadMu     sync.Mutex
 	paneReloadTimers map[int]*time.Timer
 
@@ -93,8 +106,8 @@ type App struct {
 
 	paneManager *paneManager
 
-	windowWidth  float32
-	windowHeight float32
+	windowWidth        float32
+	windowHeight       float32
 	showPaneSeparators bool
 
 	initialChannelID string
@@ -195,7 +208,7 @@ func (a *App) Run() {
 	a.refreshPaneTitles()
 	a.focusPaneInput(a.paneManager.focusedPane())
 	// Delay realtime startup slightly to avoid competing with initial full loads.
-	time.AfterFunc(700*time.Millisecond, func() {
+	time.AfterFunc(realtimeStartupDelay, func() {
 		a.startRealtimeUpdates()
 	})
 	a.win.ShowAndRun()
@@ -304,7 +317,7 @@ func (a *App) refreshRecentThreads() {
 		candidates = append(candidates, ch)
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
-		return parseSlackTSValue(candidates[i].LatestTS).After(parseSlackTSValue(candidates[j].LatestTS))
+		return api.ParseSlackTSOrZero(candidates[i].LatestTS).After(api.ParseSlackTSOrZero(candidates[j].LatestTS))
 	})
 	if len(candidates) > 24 {
 		candidates = candidates[:24]
@@ -461,8 +474,8 @@ func (a *App) rebuildFilteredChannels() {
 			if leftUnread != rightUnread {
 				return leftUnread
 			}
-			leftLatest := parseSlackTSValue(items[i].LatestTS)
-			rightLatest := parseSlackTSValue(items[j].LatestTS)
+			leftLatest := api.ParseSlackTSOrZero(items[i].LatestTS)
+			rightLatest := api.ParseSlackTSOrZero(items[j].LatestTS)
 			if !leftLatest.Equal(rightLatest) {
 				return leftLatest.After(rightLatest)
 			}
@@ -474,8 +487,8 @@ func (a *App) rebuildFilteredChannels() {
 			if items[i].UnreadCount != items[j].UnreadCount {
 				return items[i].UnreadCount > items[j].UnreadCount
 			}
-			leftLatest := parseSlackTSValue(items[i].LatestTS)
-			rightLatest := parseSlackTSValue(items[j].LatestTS)
+			leftLatest := api.ParseSlackTSOrZero(items[i].LatestTS)
+			rightLatest := api.ParseSlackTSOrZero(items[j].LatestTS)
 			if !leftLatest.Equal(rightLatest) {
 				return leftLatest.After(rightLatest)
 			}
@@ -749,6 +762,9 @@ func (a *App) loadMessagesForPane(p *chatPane) {
 	})
 }
 
+// schedulePaneScrollToBottom retries ScrollToBottom at increasing intervals.
+// Multiple attempts are needed because Fyne widget layout is asynchronous and
+// the scroll container may not know its final size immediately.
 func (a *App) schedulePaneScrollToBottom(p *chatPane) {
 	if p == nil {
 		return
@@ -764,209 +780,6 @@ func (a *App) schedulePaneScrollToBottom(p *chatPane) {
 			})
 		}()
 	}
-}
-
-func (a *App) startRealtimeUpdates() {
-	if a.client == nil {
-		return
-	}
-	a.realtimeStop = make(chan struct{})
-	go a.runRealtimeLoop(a.realtimeStop)
-}
-
-func (a *App) stopRealtimeUpdates() {
-	a.realtimeStopOnce.Do(func() {
-		if a.realtimeStop != nil {
-			close(a.realtimeStop)
-		}
-	})
-}
-
-func (a *App) runRealtimeLoop(stop <-chan struct{}) {
-	backoff := time.Second
-	for {
-		select {
-		case <-stop:
-			return
-		default:
-		}
-
-		var err error
-		if strings.TrimSpace(a.appToken) != "" {
-			err = a.runSocketModeSession(stop)
-		} else {
-			err = a.runRTMSession(stop)
-		}
-		if err != nil {
-			log.Printf("[SLACK-GUI] realtime listener disconnected: %v", err)
-		}
-
-		select {
-		case <-stop:
-			return
-		case <-time.After(backoff):
-		}
-		if backoff < 15*time.Second {
-			backoff *= 2
-			if backoff > 15*time.Second {
-				backoff = 15 * time.Second
-			}
-		}
-	}
-}
-
-func (a *App) runSocketModeSession(stop <-chan struct{}) error {
-	wsURL, err := a.client.OpenSocketModeURL(a.appToken)
-	if err != nil {
-		return err
-	}
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	log.Printf("[SLACK-GUI] realtime connected (socket mode)")
-
-	go func() {
-		<-stop
-		_ = conn.Close()
-	}()
-
-	for {
-		_, raw, err := conn.ReadMessage()
-		if err != nil {
-			return err
-		}
-		var env map[string]any
-		if err := json.Unmarshal(raw, &env); err != nil {
-			continue
-		}
-
-		if envelopeID, _ := env["envelope_id"].(string); strings.TrimSpace(envelopeID) != "" {
-			ack := map[string]string{"envelope_id": envelopeID}
-			if b, err := json.Marshal(ack); err == nil {
-				_ = conn.WriteMessage(websocket.TextMessage, b)
-			}
-		}
-
-		typeStr, _ := env["type"].(string)
-		if typeStr == "events_api" {
-			payload, ok := env["payload"].(map[string]any)
-			if !ok {
-				continue
-			}
-			evt, ok := payload["event"].(map[string]any)
-			if !ok {
-				continue
-			}
-			a.handleRealtimeEvent(evt)
-		}
-	}
-}
-
-func (a *App) runRTMSession(stop <-chan struct{}) error {
-	wsURL, err := a.client.RTMConnectURL()
-	if err != nil {
-		return err
-	}
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	log.Printf("[SLACK-GUI] realtime connected (rtm)")
-
-	go func() {
-		<-stop
-		_ = conn.Close()
-	}()
-
-	for {
-		_, raw, err := conn.ReadMessage()
-		if err != nil {
-			return err
-		}
-		var evt map[string]any
-		if err := json.Unmarshal(raw, &evt); err != nil {
-			continue
-		}
-		a.handleRealtimeEvent(evt)
-	}
-}
-
-func (a *App) handleRealtimeEvent(evt map[string]any) {
-	if evt == nil {
-		return
-	}
-	typ, _ := evt["type"].(string)
-	if typ != "message" {
-		return
-	}
-	channelID, _ := evt["channel"].(string)
-	if strings.TrimSpace(channelID) == "" {
-		return
-	}
-	threadTS, _ := evt["thread_ts"].(string)
-	ts, _ := evt["ts"].(string)
-	subtype, _ := evt["subtype"].(string)
-
-	if subtype == "message_changed" {
-		if m, ok := evt["message"].(map[string]any); ok {
-			if v, ok := m["thread_ts"].(string); ok {
-				threadTS = v
-			}
-			if v, ok := m["ts"].(string); ok {
-				ts = v
-			}
-		}
-	}
-	if subtype == "message_deleted" {
-		if v, ok := evt["deleted_ts"].(string); ok {
-			ts = v
-		}
-	}
-
-	fyne.Do(func() {
-		if subtype != "message_deleted" && !a.focusedPaneShowingChannel(channelID) {
-			a.markChannelUnreadState(channelID, ts)
-		}
-		if a.paneManager == nil {
-			return
-		}
-		for _, p := range a.paneManager.allPanes() {
-			if strings.TrimSpace(p.channelID) != strings.TrimSpace(channelID) {
-				continue
-			}
-			paneThread := strings.TrimSpace(p.threadTS)
-			if paneThread != "" {
-				eventRoot := strings.TrimSpace(threadTS)
-				if eventRoot == "" {
-					eventRoot = strings.TrimSpace(ts)
-				}
-				if eventRoot != paneThread {
-					continue
-				}
-			}
-			a.schedulePaneReload(p)
-		}
-	})
-}
-
-func (a *App) schedulePaneReload(p *chatPane) {
-	if p == nil {
-		return
-	}
-	a.paneReloadMu.Lock()
-	defer a.paneReloadMu.Unlock()
-	if t, ok := a.paneReloadTimers[p.id]; ok {
-		t.Stop()
-	}
-	a.paneReloadTimers[p.id] = time.AfterFunc(250*time.Millisecond, func() {
-		a.loadMessagesForPane(p)
-		a.paneReloadMu.Lock()
-		delete(a.paneReloadTimers, p.id)
-		a.paneReloadMu.Unlock()
-	})
 }
 
 func (a *App) openThreadInPane(p *chatPane, m api.Message) {
@@ -1030,7 +843,7 @@ func (a *App) sendFromPane(p *chatPane) {
 	p.input.SetText("")
 	a.clearReplyTarget(p)
 	go func() {
-		time.Sleep(130 * time.Millisecond)
+		time.Sleep(postSendRefreshDelay)
 		a.loadMessagesForPane(p)
 	}()
 }
@@ -1179,30 +992,6 @@ func (a *App) openThreadFromList(t threadListEntry) {
 	go a.loadMessagesForPane(p)
 }
 
-func parseSlackTSValue(ts string) time.Time {
-	ts = strings.TrimSpace(ts)
-	if ts == "" {
-		return time.Time{}
-	}
-	parts := strings.SplitN(ts, ".", 2)
-	sec, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil {
-		return time.Time{}
-	}
-	nsec := int64(0)
-	if len(parts) == 2 && parts[1] != "" {
-		frac := parts[1]
-		if len(frac) > 9 {
-			frac = frac[:9]
-		}
-		for len(frac) < 9 {
-			frac += "0"
-		}
-		nsec, _ = strconv.ParseInt(frac, 10, 64)
-	}
-	return time.Unix(sec, nsec)
-}
-
 var mentionHandleRE = regexp.MustCompile(`(^|[\s(\[{])@([a-zA-Z0-9._-]{1,80})`)
 var mentionSlackIDRE = regexp.MustCompile(`<@([A-Z0-9]+)>`)
 
@@ -1273,10 +1062,10 @@ func (a *App) openMediaDialog(f api.File) {
 			}
 			cimg := canvas.NewImageFromImage(img)
 			cimg.FillMode = canvas.ImageFillContain
-			cimg.SetMinSize(fyne.NewSize(560, 420))
+			cimg.SetMinSize(fyne.NewSize(imagePreviewMinWidth, imagePreviewMinHeight))
 			w := a.fyneApp.NewWindow("Media: " + f.Name)
 			w.SetContent(container.NewPadded(cimg))
-			w.Resize(fyne.NewSize(700, 520))
+			w.Resize(fyne.NewSize(imageWindowWidth, imageWindowHeight))
 			w.Show()
 		})
 	}()
@@ -1588,1097 +1377,6 @@ func (a *App) restorePaneLayoutState() {
 	}
 }
 
-type fixedWidthWrap struct {
-	widget.BaseWidget
-	child fyne.CanvasObject
-	width float32
-	show  bool
-}
-
-func newFixedWidthWrap(child fyne.CanvasObject, width float32) *fixedWidthWrap {
-	w := &fixedWidthWrap{child: child, width: width, show: true}
-	w.ExtendBaseWidget(w)
-	return w
-}
-
-func (w *fixedWidthWrap) CreateRenderer() fyne.WidgetRenderer {
-	return widget.NewSimpleRenderer(w.child)
-}
-func (w *fixedWidthWrap) MinSize() fyne.Size {
-	if !w.show {
-		return fyne.NewSize(0, 0)
-	}
-	return fyne.NewSize(w.width, w.child.MinSize().Height)
-}
-
-type splitDir int
-
-const (
-	splitHorizontal splitDir = iota
-	splitVertical
-)
-
-type paneNode struct {
-	pane        *chatPane
-	left, right *paneNode
-	dir         splitDir
-}
-
-func (n *paneNode) isLeaf() bool { return n != nil && n.pane != nil }
-
-func (n *paneNode) allPanes() []*chatPane {
-	if n == nil {
-		return nil
-	}
-	if n.isLeaf() {
-		return []*chatPane{n.pane}
-	}
-	return append(n.left.allPanes(), n.right.allPanes()...)
-}
-
-func (n *paneNode) buildWidget(showSeparators bool) fyne.CanvasObject {
-	if n.isLeaf() {
-		return n.pane.widget()
-	}
-	l := n.left.buildWidget(showSeparators)
-	r := n.right.buildWidget(showSeparators)
-	if n.dir == splitHorizontal {
-		s := container.NewHSplit(l, r)
-		s.SetOffset(0.5)
-		if showSeparators {
-			return newSplitWithSeparator(s, splitHorizontal)
-		}
-		return s
-	}
-	s := container.NewVSplit(l, r)
-	s.SetOffset(0.5)
-	if showSeparators {
-		return newSplitWithSeparator(s, splitVertical)
-	}
-	return s
-}
-
-func (n *paneNode) split(target *chatPane, add *chatPane, dir splitDir) bool {
-	if n.isLeaf() {
-		if n.pane != target {
-			return false
-		}
-		n.left = &paneNode{pane: n.pane}
-		n.right = &paneNode{pane: add}
-		n.dir = dir
-		n.pane = nil
-		return true
-	}
-	return n.left.split(target, add, dir) || n.right.split(target, add, dir)
-}
-
-func (n *paneNode) remove(target *chatPane) bool {
-	if n == nil || n.isLeaf() {
-		return false
-	}
-	if n.left.isLeaf() && n.left.pane == target {
-		*n = *n.right
-		return true
-	}
-	if n.right.isLeaf() && n.right.pane == target {
-		*n = *n.left
-		return true
-	}
-	return n.left.remove(target) || n.right.remove(target)
-}
-
-type paneManager struct {
-	root       paneNode
-	focused    *chatPane
-	holder     *fyne.Container
-	maxPanes   int
-	showSeparators bool
-	appFocused bool
-	onFocused  func(*chatPane)
-	makePane   func() *chatPane
-}
-
-func newPaneManager(onFocused func(*chatPane), makePane func() *chatPane) *paneManager {
-	pm := &paneManager{maxPanes: 8, onFocused: onFocused, appFocused: true, showSeparators: true}
-	pm.makePane = makePane
-	if pm.makePane == nil {
-		pm.makePane = func() *chatPane {
-			return newChatPane(
-				func(cp *chatPane) { pm.setFocus(cp) },
-				nil,
-				nil,
-				nil,
-				nil,
-				nil,
-			)
-		}
-	}
-	first := pm.makePane()
-	pm.root = paneNode{pane: first}
-	pm.focused = first
-	first.setFocused(true)
-	pm.holder = container.NewMax(pm.root.buildWidget(pm.showSeparators))
-	pm.syncInputVisibility(false)
-	return pm
-}
-
-func (pm *paneManager) widget() fyne.CanvasObject { return pm.holder }
-func (pm *paneManager) focusedPane() *chatPane    { return pm.focused }
-func (pm *paneManager) allPanes() []*chatPane     { return pm.root.allPanes() }
-
-func (pm *paneManager) setFocus(p *chatPane) {
-	if p == nil || pm.focused == p {
-		return
-	}
-	if pm.focused != nil {
-		pm.focused.setFocused(false)
-	}
-	pm.focused = p
-	pm.focused.setFocused(true)
-	pm.syncInputVisibility(true)
-	if pm.onFocused != nil {
-		pm.onFocused(p)
-	}
-}
-
-func (pm *paneManager) splitFocused(dir splitDir, newPane *chatPane) {
-	if pm.focused == nil || len(pm.allPanes()) >= pm.maxPanes || newPane == nil {
-		return
-	}
-	pm.root.split(pm.focused, newPane, dir)
-	pm.setFocus(newPane)
-	pm.syncInputVisibility(true)
-	pm.rebuild()
-}
-
-func (pm *paneManager) closeFocused() {
-	panes := pm.allPanes()
-	if len(panes) <= 1 || pm.focused == nil {
-		return
-	}
-	var next *chatPane
-	for i, p := range panes {
-		if p == pm.focused {
-			if i > 0 {
-				next = panes[i-1]
-			} else if i+1 < len(panes) {
-				next = panes[i+1]
-			}
-			break
-		}
-	}
-	pm.root.remove(pm.focused)
-	pm.focused = next
-	if pm.focused != nil {
-		pm.focused.setFocused(true)
-	}
-	pm.syncInputVisibility(false)
-	pm.rebuild()
-}
-
-func (pm *paneManager) rebuild() {
-	pm.holder.Objects = []fyne.CanvasObject{pm.root.buildWidget(pm.showSeparators)}
-	pm.holder.Refresh()
-}
-
-func (pm *paneManager) setShowSeparators(show bool) {
-	if pm.showSeparators == show {
-		return
-	}
-	pm.showSeparators = show
-	pm.rebuild()
-}
-
-type splitWithSeparator struct {
-	widget.BaseWidget
-	split *container.Split
-	dir   splitDir
-	line  *canvas.Rectangle
-}
-
-func newSplitWithSeparator(split *container.Split, dir splitDir) *splitWithSeparator {
-	w := &splitWithSeparator{
-		split: split,
-		dir:   dir,
-		line:  canvas.NewRectangle(color.NRGBA{R: 132, G: 139, B: 165, A: 52}),
-	}
-	w.line.StrokeWidth = 0
-	w.ExtendBaseWidget(w)
-	return w
-}
-
-func (w *splitWithSeparator) CreateRenderer() fyne.WidgetRenderer {
-	return &splitWithSeparatorRenderer{w: w, objs: []fyne.CanvasObject{w.split, w.line}}
-}
-
-type splitWithSeparatorRenderer struct {
-	w    *splitWithSeparator
-	objs []fyne.CanvasObject
-}
-
-func (r *splitWithSeparatorRenderer) Layout(size fyne.Size) {
-	r.w.split.Resize(size)
-	r.w.split.Move(fyne.NewPos(0, 0))
-	offset := float32(r.w.split.Offset)
-	if offset < 0 {
-		offset = 0
-	}
-	if offset > 1 {
-		offset = 1
-	}
-	if r.w.dir == splitHorizontal {
-		x := size.Width*offset - 0.5
-		if x < 0 {
-			x = 0
-		}
-		r.w.line.Move(fyne.NewPos(x, 0))
-		r.w.line.Resize(fyne.NewSize(1, size.Height))
-		return
-	}
-	y := size.Height*offset - 0.5
-	if y < 0 {
-		y = 0
-	}
-	r.w.line.Move(fyne.NewPos(0, y))
-	r.w.line.Resize(fyne.NewSize(size.Width, 1))
-}
-
-func (r *splitWithSeparatorRenderer) MinSize() fyne.Size {
-	return r.w.split.MinSize()
-}
-
-func (r *splitWithSeparatorRenderer) Refresh() {
-	base := colorToNRGBA(theme.Color(theme.ColorNameForeground))
-	base.A = 52
-	r.w.line.FillColor = base
-	r.Layout(r.w.Size())
-	canvas.Refresh(r.w.line)
-	canvas.Refresh(r.w.split)
-}
-
-func (r *splitWithSeparatorRenderer) Objects() []fyne.CanvasObject { return r.objs }
-func (r *splitWithSeparatorRenderer) Destroy()                     {}
-
-func colorToNRGBA(c color.Color) color.NRGBA {
-	r, g, b, a := c.RGBA()
-	return color.NRGBA{R: uint8(r >> 8), G: uint8(g >> 8), B: uint8(b >> 8), A: uint8(a >> 8)}
-}
-
-func (pm *paneManager) setAppFocused(focused bool) {
-	if pm.appFocused == focused {
-		return
-	}
-	pm.appFocused = focused
-	pm.syncInputVisibility(false)
-}
-
-func (pm *paneManager) syncInputVisibility(reveal bool) {
-	for _, p := range pm.allPanes() {
-		p.setFocused(pm.appFocused && p == pm.focused)
-		p.setInputVisible(pm.appFocused && p == pm.focused, reveal)
-	}
-}
-
-type paneManagerState struct {
-	Root          *paneStateNode `json:"root"`
-	FocusedPaneID int            `json:"focusedPaneID"`
-}
-
-type paneStateNode struct {
-	PaneID    int            `json:"paneID,omitempty"`
-	ChannelID string         `json:"channelID,omitempty"`
-	ThreadTS  string         `json:"threadTS,omitempty"`
-	Dir       string         `json:"dir,omitempty"`
-	Left      *paneStateNode `json:"left,omitempty"`
-	Right     *paneStateNode `json:"right,omitempty"`
-}
-
-func (pm *paneManager) serializeState() (string, error) {
-	state := paneManagerState{
-		Root:          serializePaneNode(&pm.root),
-		FocusedPaneID: -1,
-	}
-	if pm.focused != nil {
-		state.FocusedPaneID = pm.focused.id
-	}
-	raw, err := json.Marshal(state)
-	if err != nil {
-		return "", err
-	}
-	return string(raw), nil
-}
-
-func (pm *paneManager) restoreState(raw string) error {
-	if strings.TrimSpace(raw) == "" {
-		return nil
-	}
-	var state paneManagerState
-	if err := json.Unmarshal([]byte(raw), &state); err != nil {
-		return err
-	}
-	if state.Root == nil {
-		return fmt.Errorf("invalid pane state root")
-	}
-	idMap := map[int]*chatPane{}
-	root, err := pm.restoreNode(state.Root, idMap)
-	if err != nil {
-		return err
-	}
-	pm.root = *root
-	pm.focused = idMap[state.FocusedPaneID]
-	if pm.focused == nil {
-		all := pm.allPanes()
-		if len(all) > 0 {
-			pm.focused = all[0]
-		}
-	}
-	for _, p := range pm.allPanes() {
-		p.setFocused(false)
-	}
-	if pm.focused != nil {
-		pm.focused.setFocused(true)
-	}
-	paneIDCounter = maxPaneID(pm.allPanes()) + 1
-	pm.rebuild()
-	return nil
-}
-
-func (pm *paneManager) restoreNode(n *paneStateNode, idMap map[int]*chatPane) (*paneNode, error) {
-	if n == nil {
-		return nil, fmt.Errorf("nil node")
-	}
-	if n.Left == nil && n.Right == nil {
-		p := pm.makePane()
-		p.id = n.PaneID
-		p.channelID = n.ChannelID
-		p.threadTS = n.ThreadTS
-		if strings.TrimSpace(p.threadTS) != "" {
-			p.setThreadBanner("Thread view")
-		} else {
-			p.setThreadBanner("")
-		}
-		idMap[p.id] = p
-		return &paneNode{pane: p}, nil
-	}
-	if n.Left == nil || n.Right == nil {
-		return nil, fmt.Errorf("invalid split node")
-	}
-	left, err := pm.restoreNode(n.Left, idMap)
-	if err != nil {
-		return nil, err
-	}
-	right, err := pm.restoreNode(n.Right, idMap)
-	if err != nil {
-		return nil, err
-	}
-	dir := splitHorizontal
-	if strings.ToLower(n.Dir) == "vertical" {
-		dir = splitVertical
-	}
-	return &paneNode{left: left, right: right, dir: dir}, nil
-}
-
-func serializePaneNode(n *paneNode) *paneStateNode {
-	if n == nil {
-		return nil
-	}
-	if n.isLeaf() {
-		return &paneStateNode{
-			PaneID:    n.pane.id,
-			ChannelID: n.pane.channelID,
-			ThreadTS:  n.pane.threadTS,
-		}
-	}
-	dir := "horizontal"
-	if n.dir == splitVertical {
-		dir = "vertical"
-	}
-	return &paneStateNode{
-		Dir:   dir,
-		Left:  serializePaneNode(n.left),
-		Right: serializePaneNode(n.right),
-	}
-}
-
-func maxPaneID(panes []*chatPane) int {
-	maxID := -1
-	for _, p := range panes {
-		if p != nil && p.id > maxID {
-			maxID = p.id
-		}
-	}
-	return maxID
-}
-
-type chatPane struct {
-	id           int
-	root         *paneSurface
-	panel        *fyne.Container
-	title        *widget.Label
-	viewport     *fyne.Container
-	msgBox       *fyne.Container
-	msgScroll    *container.Scroll
-	input        *focusEntry
-	inputCard    *fyne.Container
-	inputGap     *canvas.Rectangle
-	inputVisible bool
-	revealAnim   *fyne.Animation
-	replyHolder  *fyne.Container
-	replyLabel   *widget.Label
-	threadHolder *fyne.Container
-	threadLabel  *widget.Label
-
-	channelID   string
-	channelName string
-	threadTS    string
-	replyTarget *api.Message
-
-	inputBg *canvas.Rectangle
-}
-
-func newChatPane(onActivate func(*chatPane), onSend func(*chatPane), onExitThread func(*chatPane), onCancelReply func(*chatPane), onResized func(*chatPane), onShortcut func(fyne.Shortcut) bool) *chatPane {
-	p := &chatPane{id: paneIDCounter}
-	paneIDCounter++
-	p.title = widget.NewLabel("Select a channel")
-	p.title.Importance = widget.HighImportance
-	p.msgBox = container.NewVBox()
-	p.msgScroll = container.NewVScroll(p.msgBox)
-	p.input = newFocusEntry(func() {
-		if onActivate != nil {
-			onActivate(p)
-		}
-	}, onShortcut, func() {
-		if strings.TrimSpace(p.threadTS) != "" {
-			if onExitThread != nil {
-				onExitThread(p)
-			}
-			return
-		}
-		if p.replyTarget != nil && onCancelReply != nil {
-			onCancelReply(p)
-		}
-	})
-	p.input.Wrapping = fyne.TextWrapWord
-	p.input.SetMinRowsVisible(2)
-	p.input.OnSubmitted = func(_ string) {
-		if onSend != nil {
-			onSend(p)
-		}
-	}
-	p.replyLabel = widget.NewLabel("")
-	p.threadLabel = widget.NewLabel("")
-	p.threadHolder = container.NewBorder(nil, nil, nil, widget.NewButton("Back", func() {
-		if onExitThread != nil {
-			onExitThread(p)
-		}
-	}), p.threadLabel)
-	p.threadHolder.Hide()
-	p.replyHolder = container.NewBorder(nil, nil, nil, widget.NewButton("×", func() {
-		if onCancelReply != nil {
-			onCancelReply(p)
-		}
-	}), p.replyLabel)
-	p.replyHolder.Hide()
-
-	p.inputGap = canvas.NewRectangle(color.Transparent)
-	p.inputGap.SetMinSize(fyne.NewSize(1, 0))
-	p.inputBg = canvas.NewRectangle(theme.Color(theme.ColorNameInputBackground))
-	inputHPad := float32(8)
-	entryRow := container.NewMax(
-		p.inputBg,
-		container.NewBorder(nil, nil, fixedWidthSpacer(inputHPad), fixedWidthSpacer(inputHPad), p.input),
-	)
-	p.inputCard = container.NewVBox(p.threadHolder, p.replyHolder, entryRow, p.inputGap)
-	p.inputVisible = true
-	p.viewport = container.NewBorder(nil, p.inputCard, nil, nil, p.msgScroll)
-	p.viewport.Objects = []fyne.CanvasObject{p.msgScroll, p.inputCard}
-	p.panel = container.NewMax(p.viewport)
-	p.root = newPaneSurface(p.panel, func() {
-		if onActivate != nil {
-			onActivate(p)
-		}
-	}, func() {
-		if onResized != nil {
-			onResized(p)
-		}
-	})
-	return p
-}
-
-func (p *chatPane) widget() fyne.CanvasObject { return p.root }
-
-func (p *chatPane) setFocused(focused bool) {
-	_ = focused
-}
-
-func (p *chatPane) setTitle(t string) { p.title.SetText(t) }
-
-func (p *chatPane) setThreadBanner(text string) {
-	if p.threadHolder == nil || p.threadLabel == nil {
-		return
-	}
-	if strings.TrimSpace(text) == "" {
-		p.threadLabel.SetText("")
-		p.threadHolder.Hide()
-		return
-	}
-	p.threadLabel.SetText(text)
-	p.threadHolder.Show()
-}
-
-func (p *chatPane) setInputVisible(visible bool, reveal bool) {
-	if p.inputVisible == visible {
-		return
-	}
-	if p.revealAnim != nil {
-		p.revealAnim.Stop()
-		p.revealAnim = nil
-	}
-	p.inputVisible = visible
-	if visible {
-		if reveal {
-			revealSpacer := canvas.NewRectangle(color.Transparent)
-			start := float32(14)
-			revealSpacer.SetMinSize(fyne.NewSize(1, start))
-			p.viewport.Objects = []fyne.CanvasObject{p.msgScroll, container.NewVBox(revealSpacer, p.inputCard)}
-			p.panel.Refresh()
-			p.revealAnim = fyne.NewAnimation(130*time.Millisecond, func(f float32) {
-				h := start * (1 - f)
-				revealSpacer.SetMinSize(fyne.NewSize(1, h))
-				p.panel.Refresh()
-			})
-			p.revealAnim.Curve = fyne.AnimationEaseOut
-			p.revealAnim.Start()
-			return
-		}
-		p.viewport.Objects = []fyne.CanvasObject{p.msgScroll, p.inputCard}
-	} else {
-		hiddenSpacer := canvas.NewRectangle(color.Transparent)
-		hiddenSpacer.SetMinSize(fyne.NewSize(1, 10))
-		p.viewport.Objects = []fyne.CanvasObject{p.msgScroll, hiddenSpacer}
-	}
-	p.panel.Refresh()
-	for _, d := range []time.Duration{0, 80 * time.Millisecond, 180 * time.Millisecond, 320 * time.Millisecond} {
-		d := d
-		go func() {
-			if d > 0 {
-				time.Sleep(d)
-			}
-			fyne.Do(func() {
-				p.msgScroll.ScrollToBottom()
-			})
-		}()
-	}
-}
-
-func (p *chatPane) clearMessages() {
-	p.msgBox.Objects = nil
-	p.msgBox.Refresh()
-}
-
-func (p *chatPane) refreshForTheme() {
-	if p.inputBg != nil {
-		p.inputBg.FillColor = theme.Color(theme.ColorNameInputBackground)
-		p.inputBg.Refresh()
-	}
-	p.replyLabel.Refresh()
-	p.threadLabel.Refresh()
-	p.title.Refresh()
-	p.msgBox.Refresh()
-	p.panel.Refresh()
-}
-
-func (p *chatPane) setMessages(msgs []api.Message, currentUserID, selfUserID string, onThread func(api.Message), onReply func(api.Message), onMedia func(api.File)) {
-	p.msgBox.Objects = nil
-	inThreadView := strings.TrimSpace(p.threadTS) != ""
-	for i, m := range msgs {
-		showHeader := isLastInSenderGroup(msgs, i)
-		isFromMe := strings.TrimSpace(m.UserID) != "" && strings.TrimSpace(m.UserID) == strings.TrimSpace(currentUserID)
-		mentionedMe := messageMentionsUser(m.Text, selfUserID)
-		p.msgBox.Add(renderMessageRow(m, isFromMe, mentionedMe, onThread, onReply, onMedia, showHeader, inThreadView))
-	}
-	p.msgBox.Refresh()
-	for _, d := range []time.Duration{0, 60 * time.Millisecond, 200 * time.Millisecond, 500 * time.Millisecond, 900 * time.Millisecond, 1400 * time.Millisecond} {
-		go func(delay time.Duration) {
-			if delay > 0 {
-				time.Sleep(delay)
-			}
-			fyne.Do(func() {
-				p.msgScroll.ScrollToBottom()
-			})
-		}(d)
-	}
-}
-
-func renderMessageRow(m api.Message, isFromMe bool, mentionedMe bool, onThread func(api.Message), onReply func(api.Message), onMedia func(api.File), showHeader bool, inThreadView bool) fyne.CanvasObject {
-	name := senderName(m)
-	ts := canvas.NewText(formatHoverTimestamp(m.Time)+" ", color.NRGBA{R: 100, G: 106, B: 130, A: 0})
-	ts.TextSize = hoverTimestampTextSize()
-	hintText := "reply in thread"
-	if m.ReplyCount > 0 {
-		hintText = "view thread"
-	}
-	if inThreadView {
-		hintText = ""
-	}
-	hint := canvas.NewText(hintText, color.NRGBA{R: 100, G: 106, B: 130, A: 0})
-	hint.TextSize = hoverTimestampTextSize()
-
-	body := widget.NewLabel(m.Text)
-	body.Wrapping = fyne.TextWrapWord
-	if isFromMe {
-		body.Alignment = fyne.TextAlignTrailing
-		body.Importance = widget.SuccessImportance
-	}
-	row := container.NewVBox(alignOutgoingRow(body, isFromMe))
-	rowWithMeta := container.NewVBox()
-	if quoted := strings.TrimSpace(m.ForwardedText); quoted != "" {
-		preview := compactQuotedPreview(quoted)
-		quoteText := widget.NewLabel("↪ " + preview)
-		quoteText.Wrapping = fyne.TextWrapWord
-		quoteText.TextStyle = fyne.TextStyle{Italic: true}
-		quoteText.Importance = widget.LowImportance
-		quoteTextRow := container.NewPadded(quoteText)
-		quoteBg := canvas.NewRectangle(color.NRGBA{R: 92, G: 99, B: 126, A: 22})
-		quoteBg.StrokeWidth = 0
-		quoteBar := canvas.NewRectangle(color.NRGBA{R: 122, G: 162, B: 247, A: 170})
-		quoteBar.SetMinSize(fyne.NewSize(1, 1))
-		quoteContent := container.NewMax(quoteBg, quoteTextRow)
-		quote := container.NewBorder(nil, nil, quoteBar, nil, quoteContent)
-		rowWithMeta.Add(alignOutgoingRow(quote, isFromMe))
-	}
-	rowWithMeta.Add(row)
-	openThread := func() {
-		if inThreadView {
-			return
-		}
-		if onThread == nil {
-			return
-		}
-		onThread(m)
-	}
-	if !inThreadView && m.ReplyCount > 0 {
-		threadLabel := fmt.Sprintf("%d repl%s · View thread", m.ReplyCount, pluralSuffix(m.ReplyCount))
-		rowWithMeta.Add(alignOutgoingRow(newSubtleTapLabel(threadLabel, openThread), isFromMe))
-	}
-
-	var content *fyne.Container
-	if showHeader {
-		sender := canvas.NewText(name, senderColor(name, isFromMe))
-		sender.TextStyle = fyne.TextStyle{Bold: true}
-		sender.TextSize = hoverSenderTextSize()
-		if isFromMe {
-			sender.Alignment = fyne.TextAlignTrailing
-			content = container.NewVBox(alignOutgoingRow(sender, true), rowWithMeta)
-		} else {
-			content = container.NewVBox(sender, rowWithMeta)
-		}
-	} else {
-		content = container.NewVBox(rowWithMeta)
-	}
-	_ = onReply
-	for _, f := range m.Files {
-		ff := f
-		name := strings.TrimSpace(f.Name)
-		if name == "" {
-			name = "file"
-		}
-		if f.IsImage() && strings.TrimSpace(f.BestImageURL()) != "" {
-			rowWithMeta.Add(widget.NewHyperlink(name, mustParseURL(f.BestImageURL())))
-			rowWithMeta.Add(alignOutgoingRow(newSubtleTapLabel("Open image", func() {
-				if onMedia != nil {
-					onMedia(ff)
-				}
-			}), isFromMe))
-			continue
-		}
-		if strings.TrimSpace(f.Permalink) != "" {
-			rowWithMeta.Add(widget.NewHyperlink(name, mustParseURL(f.Permalink)))
-		} else {
-			rowWithMeta.Add(widget.NewLabel(name))
-		}
-	}
-	rowObj := newHoverMessageRow(content, ts, hint, openThread)
-	rowCanvas := applyMessageSideIndent(rowObj)
-	if !isFromMe && mentionedMe {
-		bg := canvas.NewRectangle(color.NRGBA{R: 66, G: 53, B: 24, A: 120})
-		return container.NewMax(bg, rowCanvas)
-	}
-	return rowCanvas
-}
-
-func pluralSuffix(n int) string {
-	if n == 1 {
-		return "y"
-	}
-	return "ies"
-}
-
-func senderName(m api.Message) string {
-	if s := strings.TrimSpace(m.Username); s != "" {
-		return s
-	}
-	if s := strings.TrimSpace(m.UserID); s != "" {
-		return s
-	}
-	if strings.TrimSpace(m.BotID) != "" {
-		return "bot"
-	}
-	return "unknown"
-}
-
-func senderColor(name string, isFromMe bool) color.Color {
-	if isFromMe {
-		return color.NRGBA{R: 125, G: 207, B: 255, A: 255}
-	}
-	palette := []color.NRGBA{
-		{R: 122, G: 162, B: 247, A: 255},
-		{R: 158, G: 206, B: 106, A: 255},
-		{R: 224, G: 175, B: 104, A: 255},
-		{R: 247, G: 118, B: 142, A: 255},
-		{R: 187, G: 154, B: 247, A: 255},
-		{R: 125, G: 207, B: 255, A: 255},
-		{R: 231, G: 130, B: 132, A: 255},
-		{R: 115, G: 218, B: 202, A: 255},
-	}
-	trimmed := strings.TrimSpace(strings.ToLower(name))
-	if trimmed == "" {
-		return palette[0]
-	}
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(trimmed))
-	return palette[int(h.Sum32())%len(palette)]
-}
-
-func threadRootTS(m api.Message) string {
-	if ts := strings.TrimSpace(m.ThreadTS); ts != "" {
-		return ts
-	}
-	return strings.TrimSpace(m.TS)
-}
-
-func isLastInSenderGroup(msgs []api.Message, idx int) bool {
-	if idx+1 >= len(msgs) {
-		return true
-	}
-	cur, next := msgs[idx], msgs[idx+1]
-	if senderName(cur) != senderName(next) {
-		return true
-	}
-	return next.Time.Sub(cur.Time) > 4*time.Minute
-}
-
-func hoverSenderTextSize() float32 {
-	size := float32(theme.TextSize()) - 1
-	if size < 8 {
-		size = 8
-	}
-	return size
-}
-
-func hoverTimestampTextSize() float32 {
-	size := hoverSenderTextSize() - 1
-	if size < 8 {
-		size = 8
-	}
-	return size
-}
-
-// messageMetaActionTextSize is for inline chat actions (e.g. view thread, open image) — smaller than body text.
-func messageMetaActionTextSize() float32 {
-	size := hoverTimestampTextSize() - 1
-	if size < 8 {
-		size = 8
-	}
-	return size
-}
-
-func formatHoverTimestamp(t time.Time) string {
-	return t.Format("15:04")
-}
-
-func messageMentionsUser(text, userID string) bool {
-	id := strings.TrimSpace(userID)
-	if id == "" {
-		return false
-	}
-	return strings.Contains(text, "<@"+id+">")
-}
-
-func applyMessageSideIndent(row fyne.CanvasObject) fyne.CanvasObject {
-	return container.NewBorder(nil, nil, fixedWidthSpacer(8), fixedWidthSpacer(8), row)
-}
-
-func fixedWidthSpacer(width float32) fyne.CanvasObject {
-	r := canvas.NewRectangle(color.Transparent)
-	r.SetMinSize(fyne.NewSize(width, 1))
-	return r
-}
-
-func alignOutgoingRow(obj fyne.CanvasObject, isFromMe bool) fyne.CanvasObject {
-	if !isFromMe {
-		return obj
-	}
-	return container.NewBorder(nil, nil, layout.NewSpacer(), nil, obj)
-}
-
-func truncate(s string, n int) string {
-	if n <= 0 || len([]rune(s)) <= n {
-		return s
-	}
-	r := []rune(s)
-	return string(r[:n]) + "…"
-}
-
-func compactQuotedPreview(s string) string {
-	clean := strings.Join(strings.Fields(strings.TrimSpace(s)), " ")
-	if clean == "" {
-		return ""
-	}
-	r := []rune(clean)
-	if len(r) <= 160 {
-		if len(r) <= 80 {
-			return clean
-		}
-		return string(r[:80]) + "\n" + string(r[80:])
-	}
-	return string(r[:80]) + "\n" + string(r[80:160]) + "…"
-}
-
-func mustParseURL(raw string) *url.URL {
-	u, err := url.Parse(raw)
-	if err != nil {
-		u, _ = url.Parse("https://slack.com")
-	}
-	return u
-}
-
-// subtleTapLabel is muted, small text that reads as metadata but behaves as a tap target (no button chrome).
-type subtleTapLabel struct {
-	widget.BaseWidget
-	text  *canvas.Text
-	onTap func()
-}
-
-func newSubtleTapLabel(label string, onTap func()) *subtleTapLabel {
-	t := &subtleTapLabel{
-		text:  canvas.NewText(label, color.NRGBA{R: 95, G: 100, B: 122, A: 210}),
-		onTap: onTap,
-	}
-	t.text.TextSize = messageMetaActionTextSize()
-	t.text.TextStyle = fyne.TextStyle{}
-	t.ExtendBaseWidget(t)
-	return t
-}
-
-func (t *subtleTapLabel) CreateRenderer() fyne.WidgetRenderer {
-	return widget.NewSimpleRenderer(t.text)
-}
-
-func (t *subtleTapLabel) MinSize() fyne.Size {
-	s := fyne.MeasureText(t.text.Text, t.text.TextSize, t.text.TextStyle)
-	return fyne.NewSize(s.Width+4, s.Height+2)
-}
-
-func (t *subtleTapLabel) Tapped(_ *fyne.PointEvent) {
-	if t.onTap != nil {
-		t.onTap()
-	}
-}
-
-func (t *subtleTapLabel) TappedSecondary(_ *fyne.PointEvent) {}
-
-func (t *subtleTapLabel) Cursor() desktop.Cursor {
-	return desktop.PointerCursor
-}
-
-type paneSurface struct {
-	widget.BaseWidget
-	content    fyne.CanvasObject
-	onActivate func()
-	onResize   func()
-}
-
-func newPaneSurface(content fyne.CanvasObject, onActivate func(), onResize func()) *paneSurface {
-	s := &paneSurface{content: content, onActivate: onActivate, onResize: onResize}
-	s.ExtendBaseWidget(s)
-	return s
-}
-
-func (s *paneSurface) CreateRenderer() fyne.WidgetRenderer {
-	return &paneSurfaceRenderer{surface: s}
-}
-
-type paneSurfaceRenderer struct {
-	surface  *paneSurface
-	lastSize fyne.Size
-}
-
-func (r *paneSurfaceRenderer) Layout(size fyne.Size) {
-	r.surface.content.Move(fyne.NewPos(0, 0))
-	r.surface.content.Resize(size)
-	if size != r.lastSize {
-		r.lastSize = size
-		if r.surface.onResize != nil {
-			r.surface.onResize()
-		}
-	}
-}
-
-func (r *paneSurfaceRenderer) MinSize() fyne.Size {
-	return r.surface.content.MinSize()
-}
-
-func (r *paneSurfaceRenderer) Refresh() {
-	canvas.Refresh(r.surface.content)
-}
-
-func (r *paneSurfaceRenderer) Objects() []fyne.CanvasObject {
-	return []fyne.CanvasObject{r.surface.content}
-}
-
-func (r *paneSurfaceRenderer) Destroy() {}
-func (s *paneSurface) Tapped(_ *fyne.PointEvent) {
-	if s.onActivate != nil {
-		s.onActivate()
-	}
-}
-func (s *paneSurface) TappedSecondary(_ *fyne.PointEvent) {
-	if s.onActivate != nil {
-		s.onActivate()
-	}
-}
-func (s *paneSurface) MouseIn(_ *desktop.MouseEvent)    {}
-func (s *paneSurface) MouseOut()                        {}
-func (s *paneSurface) MouseMoved(_ *desktop.MouseEvent) {}
-
-type glyph struct {
-	widget.BaseWidget
-	text  *canvas.Text
-	onTap func()
-}
-
-func newGlyph(label string, onTap func()) *glyph {
-	g := &glyph{text: canvas.NewText(label, theme.Color(theme.ColorNameForeground)), onTap: onTap}
-	g.text.TextSize = 10
-	g.ExtendBaseWidget(g)
-	return g
-}
-
-func (g *glyph) CreateRenderer() fyne.WidgetRenderer { return widget.NewSimpleRenderer(g.text) }
-func (g *glyph) MinSize() fyne.Size {
-	s := fyne.MeasureText(g.text.Text, g.text.TextSize, fyne.TextStyle{})
-	return fyne.NewSize(s.Width+4, s.Height+2)
-}
-func (g *glyph) Tapped(_ *fyne.PointEvent) {
-	if g.onTap != nil {
-		g.onTap()
-	}
-}
-func (g *glyph) TappedSecondary(_ *fyne.PointEvent) {}
-
-type focusEntry struct {
-	widget.Entry
-	onFocused  func()
-	onShortcut func(fyne.Shortcut) bool
-	onEscape   func()
-	focused    bool
-}
-
-func newFocusEntry(onFocused func(), onShortcut func(fyne.Shortcut) bool, onEscape func()) *focusEntry {
-	e := &focusEntry{onFocused: onFocused, onShortcut: onShortcut, onEscape: onEscape}
-	e.MultiLine = true
-	e.ExtendBaseWidget(e)
-	return e
-}
-
-func (e *focusEntry) FocusGained() {
-	e.Entry.FocusGained()
-	e.focused = true
-	if e.onFocused != nil {
-		e.onFocused()
-	}
-}
-
-func (e *focusEntry) FocusLost() {
-	e.Entry.FocusLost()
-	e.focused = false
-}
-
-func (e *focusEntry) IsFocused() bool { return e.focused }
-
-func (e *focusEntry) CreateRenderer() fyne.WidgetRenderer {
-	return &focusEntryRenderer{inner: e.Entry.CreateRenderer()}
-}
-
-type focusEntryRenderer struct {
-	inner fyne.WidgetRenderer
-}
-
-func (r *focusEntryRenderer) Layout(size fyne.Size)        { r.inner.Layout(size) }
-func (r *focusEntryRenderer) MinSize() fyne.Size           { return r.inner.MinSize() }
-func (r *focusEntryRenderer) Destroy()                     { r.inner.Destroy() }
-func (r *focusEntryRenderer) Objects() []fyne.CanvasObject { return r.inner.Objects() }
-func (r *focusEntryRenderer) Refresh() {
-	r.inner.Refresh()
-	for _, obj := range r.inner.Objects() {
-		clearStrokeRecursive(obj)
-		clearFillRecursive(obj)
-	}
-}
-
-func clearStrokeRecursive(obj fyne.CanvasObject) {
-	if obj == nil {
-		return
-	}
-	if rect, ok := obj.(*canvas.Rectangle); ok {
-		if rect.StrokeWidth != 0 || rect.StrokeColor != color.Transparent {
-			rect.StrokeWidth = 0
-			rect.StrokeColor = color.Transparent
-			rect.Refresh()
-		}
-	}
-	if c, ok := obj.(*fyne.Container); ok {
-		for _, child := range c.Objects {
-			clearStrokeRecursive(child)
-		}
-	}
-}
-
-func clearFillRecursive(obj fyne.CanvasObject) {
-	if obj == nil {
-		return
-	}
-	if rect, ok := obj.(*canvas.Rectangle); ok {
-		if rect.FillColor != color.Transparent {
-			rect.FillColor = color.Transparent
-			rect.Refresh()
-		}
-	}
-	if c, ok := obj.(*fyne.Container); ok {
-		for _, child := range c.Objects {
-			clearFillRecursive(child)
-		}
-	}
-}
-
-func (e *focusEntry) TypedShortcut(shortcut fyne.Shortcut) {
-	if e.onShortcut != nil && e.onShortcut(shortcut) {
-		return
-	}
-	e.Entry.TypedShortcut(shortcut)
-}
-
-func (e *focusEntry) TypedKey(key *fyne.KeyEvent) {
-	if key != nil && key.Name == fyne.KeyEscape {
-		if e.onEscape != nil {
-			e.onEscape()
-			return
-		}
-	}
-	e.Entry.TypedKey(key)
-}
-
 func (a *App) handleInputShortcut(shortcut fyne.Shortcut) bool {
 	custom, ok := shortcut.(*desktop.CustomShortcut)
 	if !ok {
@@ -2714,114 +1412,4 @@ func (a *App) handleInputShortcut(shortcut fyne.Shortcut) bool {
 		return true
 	}
 	return false
-}
-
-type hoverMessageRow struct {
-	widget.BaseWidget
-	host      *fyne.Container
-	content   *fyne.Container
-	tsLabel   *canvas.Text
-	hintLabel *canvas.Text
-	tsAnim    *fyne.Animation
-	metaShown bool
-	onTap     func()
-}
-
-func newHoverMessageRow(content *fyne.Container, tsLabel *canvas.Text, hintLabel *canvas.Text, onTap func()) *hoverMessageRow {
-	tsLabel.Hide()
-	hintLabel.Hide()
-	host := container.NewVBox(container.NewBorder(nil, nil, tsLabel, hintLabel, content))
-	r := &hoverMessageRow{
-		content: content,
-		tsLabel: tsLabel,
-		hintLabel: hintLabel,
-		host:    host,
-		onTap:   onTap,
-	}
-	r.ExtendBaseWidget(r)
-	return r
-}
-
-func (r *hoverMessageRow) CreateRenderer() fyne.WidgetRenderer {
-	return widget.NewSimpleRenderer(r.host)
-}
-
-func (r *hoverMessageRow) MouseIn(_ *desktop.MouseEvent) {
-	if r.metaShown || r.tsLabel == nil {
-		return
-	}
-	r.metaShown = true
-	r.animateMeta(true)
-}
-
-func (r *hoverMessageRow) MouseOut() {
-	if !r.metaShown {
-		return
-	}
-	r.metaShown = false
-	r.animateMeta(false)
-}
-
-func (r *hoverMessageRow) MouseMoved(_ *desktop.MouseEvent) {}
-
-func (r *hoverMessageRow) animateMeta(visible bool) {
-	if r.tsAnim != nil {
-		r.tsAnim.Stop()
-	}
-	tsCol := color.NRGBA{R: 100, G: 106, B: 130, A: 180}
-	hintCol := color.NRGBA{R: 100, G: 106, B: 130, A: 170}
-	if visible {
-		r.tsLabel.Color = color.NRGBA{R: tsCol.R, G: tsCol.G, B: tsCol.B, A: 0}
-		r.hintLabel.Color = color.NRGBA{R: hintCol.R, G: hintCol.G, B: hintCol.B, A: 0}
-		r.tsLabel.Show()
-		r.hintLabel.Show()
-		r.host.Refresh()
-		r.tsAnim = fyne.NewAnimation(120*time.Millisecond, func(f float32) {
-			r.tsLabel.Color = color.NRGBA{R: tsCol.R, G: tsCol.G, B: tsCol.B, A: uint8(float32(tsCol.A) * f)}
-			r.hintLabel.Color = color.NRGBA{R: hintCol.R, G: hintCol.G, B: hintCol.B, A: uint8(float32(hintCol.A) * f)}
-			canvas.Refresh(r.tsLabel)
-			canvas.Refresh(r.hintLabel)
-		})
-		r.tsAnim.Curve = fyne.AnimationEaseOut
-		r.tsAnim.Start()
-		return
-	}
-	startTsA := uint8(255)
-	if c, ok := r.tsLabel.Color.(color.NRGBA); ok {
-		startTsA = c.A
-	}
-	startHintA := uint8(255)
-	if c, ok := r.hintLabel.Color.(color.NRGBA); ok {
-		startHintA = c.A
-	}
-	const dur = 110 * time.Millisecond
-	r.tsAnim = fyne.NewAnimation(dur, func(f float32) {
-		r.tsLabel.Color = color.NRGBA{R: tsCol.R, G: tsCol.G, B: tsCol.B, A: uint8(float32(startTsA) * (1 - f))}
-		r.hintLabel.Color = color.NRGBA{R: hintCol.R, G: hintCol.G, B: hintCol.B, A: uint8(float32(startHintA) * (1 - f))}
-		canvas.Refresh(r.tsLabel)
-		canvas.Refresh(r.hintLabel)
-	})
-	r.tsAnim.Curve = fyne.AnimationEaseIn
-	r.tsAnim.Start()
-	time.AfterFunc(dur, func() {
-		fyne.Do(func() {
-			if !r.metaShown {
-				r.tsLabel.Hide()
-				r.hintLabel.Hide()
-				r.host.Refresh()
-			}
-		})
-	})
-}
-
-func (r *hoverMessageRow) Tapped(_ *fyne.PointEvent) {
-	if r.onTap != nil {
-		r.onTap()
-	}
-}
-
-func (r *hoverMessageRow) TappedSecondary(_ *fyne.PointEvent) {
-	if r.onTap != nil {
-		r.onTap()
-	}
 }

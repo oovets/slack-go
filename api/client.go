@@ -576,7 +576,7 @@ func (rm rawMessage) toMessage(userMap map[string]string) (Message, bool) {
 		ForwardedText: extractForwardedText(rm.Attachments),
 		BotID:      rm.BotID,
 		Subtype:    rm.Subtype,
-		Time:       parseSlackTS(rm.TS),
+		Time:       ParseSlackTS(rm.TS),
 		Files:      files,
 		ReplyCount: rm.ReplyCount,
 	}, true
@@ -599,14 +599,34 @@ func extractForwardedText(attachments []struct {
 	return ""
 }
 
-func parseSlackTS(ts string) time.Time {
+// ParseSlackTS parses a Slack timestamp string into a time.Time.
+// Returns time.Now() if the string is empty or malformed (safe default for message timestamps).
+func ParseSlackTS(ts string) time.Time {
+	t, ok := parseSlackTSInner(ts)
+	if !ok {
+		return time.Now()
+	}
+	return t
+}
+
+// ParseSlackTSOrZero parses a Slack timestamp string into a time.Time.
+// Returns time.Time{} if the string is empty or malformed (suitable for sorting/comparison).
+func ParseSlackTSOrZero(ts string) time.Time {
+	t, ok := parseSlackTSInner(ts)
+	if !ok {
+		return time.Time{}
+	}
+	return t
+}
+
+func parseSlackTSInner(ts string) (time.Time, bool) {
 	parts := strings.SplitN(strings.TrimSpace(ts), ".", 2)
 	if len(parts) == 0 || parts[0] == "" {
-		return time.Now()
+		return time.Time{}, false
 	}
 	sec, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil {
-		return time.Now()
+		return time.Time{}, false
 	}
 	nsec := int64(0)
 	if len(parts) == 2 && parts[1] != "" {
@@ -619,5 +639,5 @@ func parseSlackTS(ts string) time.Time {
 		}
 		nsec, _ = strconv.ParseInt(frac, 10, 64)
 	}
-	return time.Unix(sec, nsec)
+	return time.Unix(sec, nsec), true
 }
