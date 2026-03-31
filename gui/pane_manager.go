@@ -129,7 +129,14 @@ func (pm *paneManager) focusedPane() *chatPane    { return pm.focused }
 func (pm *paneManager) allPanes() []*chatPane     { return pm.root.allPanes() }
 
 func (pm *paneManager) setFocus(p *chatPane) {
-	if p == nil || pm.focused == p {
+	if p == nil {
+		return
+	}
+	if pm.focused == p {
+		pm.syncInputVisibility(false)
+		if pm.onFocused != nil {
+			pm.onFocused(p)
+		}
 		return
 	}
 	if pm.focused != nil {
@@ -200,9 +207,10 @@ func (pm *paneManager) setAppFocused(focused bool) {
 }
 
 func (pm *paneManager) syncInputVisibility(reveal bool) {
+	_ = reveal
 	for _, p := range pm.allPanes() {
 		p.setFocused(pm.appFocused && p == pm.focused)
-		p.setInputVisible(pm.appFocused && p == pm.focused, reveal)
+		p.setInputVisible(true, false)
 	}
 }
 

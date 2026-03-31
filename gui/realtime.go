@@ -14,16 +14,31 @@ func (a *App) startRealtimeUpdates() {
 	if a.client == nil {
 		return
 	}
+	a.realtimeMu.Lock()
+	if a.realtimeRunning {
+		a.realtimeMu.Unlock()
+		return
+	}
 	a.realtimeStop = make(chan struct{})
+	a.realtimeRunning = true
+	a.realtimeMu.Unlock()
+	a.setStatusFromRealtime("Connecting realtime...")
 	go a.runRealtimeLoop(a.realtimeStop)
 }
 
 func (a *App) stopRealtimeUpdates() {
-	a.realtimeStopOnce.Do(func() {
-		if a.realtimeStop != nil {
-			close(a.realtimeStop)
-		}
-	})
+	a.realtimeMu.Lock()
+	if !a.realtimeRunning {
+		a.realtimeMu.Unlock()
+		return
+	}
+	stop := a.realtimeStop
+	a.realtimeStop = nil
+	a.realtimeRunning = false
+	a.realtimeMu.Unlock()
+	if stop != nil {
+		close(stop)
+	}
 }
 
 func (a *App) runRealtimeLoop(stop <-chan struct{}) {
@@ -43,13 +58,18 @@ func (a *App) runRealtimeLoop(stop <-chan struct{}) {
 		}
 		if err != nil {
 			log.Printf("[SLACK-GUI] realtime listener disconnected: %v", err)
+			a.setStatusWithActionFromRealtime(a.reconnectBackoffStatus(backoff), "Reconnect now", func() {
+				go a.restartRealtimeUpdates()
+			})
 		}
 
 		select {
 		case <-stop:
+			a.setStatusTemporaryFromRealtime("Realtime stopped", 2*time.Second)
 			return
 		case <-time.After(backoff):
 		}
+		a.setStatusFromRealtime("Reconnecting realtime...")
 		if backoff < 15*time.Second {
 			backoff *= 2
 			if backoff > 15*time.Second {
@@ -69,7 +89,7 @@ func (a *App) runSocketModeSession(stop <-chan struct{}) error {
 		return err
 	}
 	defer conn.Close()
-	log.Printf("[SLACK-GUI] realtime connected (socket mode)")
+	a.setStatusTemporaryFromRealtime("Realtime connected (socket mode)", 3*time.Second)
 
 	go func() {
 		<-stop
@@ -118,7 +138,7 @@ func (a *App) runRTMSession(stop <-chan struct{}) error {
 		return err
 	}
 	defer conn.Close()
-	log.Printf("[SLACK-GUI] realtime connected (rtm)")
+	a.setStatusTemporaryFromRealtime("Realtime connected", 3*time.Second)
 
 	go func() {
 		<-stop

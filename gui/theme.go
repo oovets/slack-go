@@ -300,6 +300,45 @@ type compactTheme struct {
 	curFamily   string
 }
 
+type themePalette struct {
+	background      color.NRGBA
+	inputBackground color.NRGBA
+	foreground      color.NRGBA
+	mutedForeground color.NRGBA
+	separator       color.NRGBA
+	hover           color.NRGBA
+	focus           color.NRGBA
+	primary         color.NRGBA
+	success         color.NRGBA
+	shadow          color.NRGBA
+}
+
+var darkPalette = themePalette{
+	background:      color.NRGBA{R: 28, G: 29, B: 38, A: 255},
+	inputBackground: color.NRGBA{R: 37, G: 40, B: 52, A: 255},
+	foreground:      color.NRGBA{R: 201, G: 209, B: 228, A: 255},
+	mutedForeground: color.NRGBA{R: 130, G: 137, B: 157, A: 255},
+	separator:       color.NRGBA{R: 102, G: 109, B: 132, A: 84},
+	hover:           color.NRGBA{R: 73, G: 79, B: 101, A: 86},
+	focus:           color.NRGBA{R: 87, G: 148, B: 255, A: 208},
+	primary:         color.NRGBA{R: 88, G: 145, B: 255, A: 255},
+	success:         color.NRGBA{R: 125, G: 184, B: 132, A: 255},
+	shadow:          color.NRGBA{A: 0},
+}
+
+var lightPalette = themePalette{
+	background:      color.NRGBA{R: 248, G: 249, B: 253, A: 255},
+	inputBackground: color.NRGBA{R: 255, G: 255, B: 255, A: 255},
+	foreground:      color.NRGBA{R: 27, G: 29, B: 35, A: 255},
+	mutedForeground: color.NRGBA{R: 106, G: 110, B: 122, A: 255},
+	separator:       color.NRGBA{R: 133, G: 138, B: 154, A: 88},
+	hover:           color.NRGBA{R: 86, G: 93, B: 118, A: 34},
+	focus:           color.NRGBA{R: 58, G: 113, B: 212, A: 190},
+	primary:         color.NRGBA{R: 53, G: 109, B: 210, A: 255},
+	success:         color.NRGBA{R: 72, G: 140, B: 83, A: 255},
+	shadow:          color.NRGBA{A: 0},
+}
+
 func newCompactTheme() *compactTheme {
 	t := &compactTheme{
 		dark:     true,
@@ -369,42 +408,42 @@ func (t *compactTheme) base() fyne.Theme {
 	return theme.LightTheme()
 }
 
-func (t *compactTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
+func (t *compactTheme) palette() themePalette {
 	if t.dark {
-		switch name {
-		case theme.ColorNameBackground:
-			return color.NRGBA{R: 26, G: 27, B: 38, A: 255}
-		case theme.ColorNameInputBackground:
-			return color.NRGBA{R: 26, G: 27, B: 38, A: 255}
-		case theme.ColorNameInputBorder:
-			return color.NRGBA{A: 0}
-		case theme.ColorNameForeground:
-			return color.NRGBA{R: 169, G: 177, B: 214, A: 255}
-		case theme.ColorNameSuccess:
-			return color.NRGBA{R: 148, G: 166, B: 150, A: 255}
-		case theme.ColorNameSeparator:
-			return color.NRGBA{A: 0}
-		case theme.ColorNameShadow:
-			return color.NRGBA{A: 0}
-		}
+		return darkPalette
 	}
-	if !t.dark {
-		switch name {
-		case theme.ColorNameBackground:
-			return color.NRGBA{R: 255, G: 255, B: 255, A: 255}
-		case theme.ColorNameInputBackground:
-			return color.NRGBA{R: 255, G: 255, B: 255, A: 255}
-		case theme.ColorNameInputBorder:
-			return color.NRGBA{A: 0}
-		case theme.ColorNameForeground:
-			return color.NRGBA{R: 15, G: 15, B: 15, A: 255}
-		case theme.ColorNameSuccess:
-			return color.NRGBA{R: 100, G: 100, B: 100, A: 255}
-		case theme.ColorNameSeparator:
-			return color.NRGBA{A: 0}
-		case theme.ColorNameShadow:
-			return color.NRGBA{A: 0}
-		}
+	return lightPalette
+}
+
+func (t *compactTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
+	p := t.palette()
+	switch name {
+	case theme.ColorNameBackground:
+		return p.background
+	case theme.ColorNameMenuBackground:
+		return p.background
+	case theme.ColorNameOverlayBackground:
+		return p.background
+	case theme.ColorNameInputBackground:
+		return p.inputBackground
+	case theme.ColorNameInputBorder:
+		return p.separator
+	case theme.ColorNameForeground:
+		return p.foreground
+	case theme.ColorNamePlaceHolder, theme.ColorNameDisabled:
+		return p.mutedForeground
+	case theme.ColorNameSeparator:
+		return p.separator
+	case theme.ColorNameHover, theme.ColorNamePressed:
+		return p.hover
+	case theme.ColorNameFocus, theme.ColorNameSelection:
+		return p.focus
+	case theme.ColorNamePrimary:
+		return p.primary
+	case theme.ColorNameSuccess:
+		return p.success
+	case theme.ColorNameShadow:
+		return p.shadow
 	}
 	return t.base().Color(name, variant)
 }
@@ -443,13 +482,16 @@ func (t *compactTheme) Size(name fyne.ThemeSizeName) float32 {
 	switch name {
 	case theme.SizeNamePadding, theme.SizeNameInnerPadding:
 		if t.compactMode {
-			return 1
+			return 2
 		}
-		return 2
+		return 4
 	case theme.SizeNameInputRadius:
-		return 0
+		if t.compactMode {
+			return 4
+		}
+		return 6
 	case theme.SizeNameInputBorder:
-		return 2
+		return 1
 	case theme.SizeNameScrollBar, theme.SizeNameScrollBarSmall:
 		return 0
 	case theme.SizeNameText, theme.SizeNameSubHeadingText:

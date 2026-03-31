@@ -76,17 +76,24 @@ func (f File) IsImage() bool {
 }
 
 type Message struct {
-	TS         string
-	ThreadTS   string
-	UserID     string
-	Username   string
-	Text       string
+	TS            string
+	ThreadTS      string
+	UserID        string
+	Username      string
+	Text          string
 	ForwardedText string
-	BotID      string
-	Subtype    string
-	Time       time.Time
-	Files      []File
-	ReplyCount int
+	BotID         string
+	Subtype       string
+	Time          time.Time
+	Files         []File
+	ReplyCount    int
+	Reactions     []Reaction
+}
+
+type Reaction struct {
+	Name  string
+	Count int
+	Users []string
 }
 
 type slackEnvelope struct {
@@ -329,6 +336,20 @@ func (c *Client) UserInfo(userID string) (*UserInfo, error) {
 	}, nil
 }
 
+func (c *Client) EmojiList() (map[string]string, error) {
+	var out struct {
+		slackEnvelope
+		Emoji map[string]string `json:"emoji"`
+	}
+	if err := c.postForm("emoji.list", nil, &out); err != nil {
+		return nil, err
+	}
+	if out.Emoji == nil {
+		return map[string]string{}, nil
+	}
+	return out.Emoji, nil
+}
+
 func (c *Client) ChannelHistory(channelID string, limit int, userMap map[string]string) ([]Message, error) {
 	if limit <= 0 {
 		limit = 80
@@ -529,6 +550,11 @@ type rawMessage struct {
 		Title      string `json:"title"`
 		AuthorName string `json:"author_name"`
 	} `json:"attachments"`
+	Reactions []struct {
+		Name  string   `json:"name"`
+		Count int      `json:"count"`
+		Users []string `json:"users"`
+	} `json:"reactions"`
 }
 
 func (rm rawMessage) toMessage(userMap map[string]string) (Message, bool) {
@@ -567,18 +593,35 @@ func (rm rawMessage) toMessage(userMap map[string]string) (Message, bool) {
 			PermalinkPublic: f.PermalinkPublic,
 		})
 	}
+	reactions := make([]Reaction, 0, len(rm.Reactions))
+	for _, r := range rm.Reactions {
+		name := strings.TrimSpace(r.Name)
+		if name == "" {
+			continue
+		}
+		users := make([]string, 0, len(r.Users))
+		for _, u := range r.Users {
+			u = strings.TrimSpace(u)
+			if u == "" {
+				continue
+			}
+			users = append(users, u)
+		}
+		reactions = append(reactions, Reaction{Name: name, Count: r.Count, Users: users})
+	}
 	return Message{
-		TS:         rm.TS,
-		ThreadTS:   rm.ThreadTS,
-		UserID:     rm.User,
-		Username:   username,
-		Text:       rm.Text,
+		TS:            rm.TS,
+		ThreadTS:      rm.ThreadTS,
+		UserID:        rm.User,
+		Username:      username,
+		Text:          rm.Text,
 		ForwardedText: extractForwardedText(rm.Attachments),
-		BotID:      rm.BotID,
-		Subtype:    rm.Subtype,
-		Time:       ParseSlackTS(rm.TS),
-		Files:      files,
-		ReplyCount: rm.ReplyCount,
+		BotID:         rm.BotID,
+		Subtype:       rm.Subtype,
+		Time:          ParseSlackTS(rm.TS),
+		Files:         files,
+		ReplyCount:    rm.ReplyCount,
+		Reactions:     reactions,
 	}, true
 }
 

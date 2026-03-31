@@ -27,6 +27,7 @@ type chatPane struct {
 	msgScroll    *container.Scroll
 	input        *focusEntry
 	inputCard    *fyne.Container
+	inputTopGap  *canvas.Rectangle
 	inputGap     *canvas.Rectangle
 	inputVisible bool
 	revealAnim   *fyne.Animation
@@ -34,13 +35,17 @@ type chatPane struct {
 	replyLabel   *widget.Label
 	threadHolder *fyne.Container
 	threadLabel  *widget.Label
+	hintLabel    *widget.Label
 
 	channelID   string
 	channelName string
 	threadTS    string
 	replyTarget *api.Message
 
-	inputBg *canvas.Rectangle
+	inputBg     *canvas.Rectangle
+	inputBorder *canvas.Rectangle
+	threadBg    *canvas.Rectangle
+	replyBg     *canvas.Rectangle
 }
 
 func newChatPane(onActivate func(*chatPane), onSend func(*chatPane), onExitThread func(*chatPane), onCancelReply func(*chatPane), onResized func(*chatPane), onShortcut func(fyne.Shortcut) bool) *chatPane {
@@ -66,36 +71,53 @@ func newChatPane(onActivate func(*chatPane), onSend func(*chatPane), onExitThrea
 		}
 	})
 	p.input.Wrapping = fyne.TextWrapWord
-	p.input.SetMinRowsVisible(2)
+	p.input.SetMinRowsVisible(1)
 	p.input.OnSubmitted = func(_ string) {
 		if onSend != nil {
 			onSend(p)
 		}
 	}
 	p.replyLabel = widget.NewLabel("")
+	p.replyLabel.Wrapping = fyne.TextTruncate
 	p.threadLabel = widget.NewLabel("")
-	p.threadHolder = container.NewBorder(nil, nil, nil, widget.NewButton("Back", func() {
+	p.threadLabel.Wrapping = fyne.TextTruncate
+	p.hintLabel = widget.NewLabel("Enter to send  |  Shift+Enter for new line  |  Ctrl+K quick switch")
+	p.hintLabel.Importance = widget.LowImportance
+	p.threadBg = canvas.NewRectangle(theme.Color(theme.ColorNameHover))
+	p.replyBg = canvas.NewRectangle(theme.Color(theme.ColorNameHover))
+	p.threadHolder = container.NewMax(p.threadBg, container.NewPadded(container.NewBorder(nil, nil, nil, widget.NewButton("Leave thread", func() {
 		if onExitThread != nil {
 			onExitThread(p)
 		}
-	}), p.threadLabel)
+	}), p.threadLabel)))
 	p.threadHolder.Hide()
-	p.replyHolder = container.NewBorder(nil, nil, nil, widget.NewButton("×", func() {
+	p.replyHolder = container.NewMax(p.replyBg, container.NewPadded(container.NewBorder(nil, nil, nil, widget.NewButton("Cancel", func() {
 		if onCancelReply != nil {
 			onCancelReply(p)
 		}
-	}), p.replyLabel)
+	}), p.replyLabel)))
 	p.replyHolder.Hide()
 
+	p.inputTopGap = canvas.NewRectangle(color.Transparent)
+	p.inputTopGap.SetMinSize(fyne.NewSize(1, 8))
 	p.inputGap = canvas.NewRectangle(color.Transparent)
 	p.inputGap.SetMinSize(fyne.NewSize(1, 0))
-	p.inputBg = canvas.NewRectangle(theme.Color(theme.ColorNameInputBackground))
+	p.inputBg = canvas.NewRectangle(color.Transparent)
+	p.inputBorder = canvas.NewRectangle(color.Transparent)
+	p.inputBorder.StrokeColor = color.Transparent
+	p.inputBorder.StrokeWidth = 0
 	inputHPad := float32(8)
+	inputVPad := float32(3)
+	inputTopPad := canvas.NewRectangle(color.Transparent)
+	inputTopPad.SetMinSize(fyne.NewSize(1, inputVPad))
+	inputBottomPad := canvas.NewRectangle(color.Transparent)
+	inputBottomPad.SetMinSize(fyne.NewSize(1, inputVPad))
 	entryRow := container.NewMax(
+		p.inputBorder,
 		p.inputBg,
-		container.NewBorder(nil, nil, fixedWidthSpacer(inputHPad), fixedWidthSpacer(inputHPad), p.input),
+		container.NewBorder(inputTopPad, inputBottomPad, fixedWidthSpacer(inputHPad), fixedWidthSpacer(inputHPad), p.input),
 	)
-	p.inputCard = container.NewVBox(p.threadHolder, p.replyHolder, entryRow, p.inputGap)
+	p.inputCard = container.NewVBox(p.inputTopGap, p.threadHolder, p.replyHolder, entryRow, p.hintLabel, p.inputGap)
 	p.inputVisible = true
 	p.viewport = container.NewBorder(nil, p.inputCard, nil, nil, p.msgScroll)
 	p.viewport.Objects = []fyne.CanvasObject{p.msgScroll, p.inputCard}
@@ -134,6 +156,7 @@ func (p *chatPane) setThreadBanner(text string) {
 }
 
 func (p *chatPane) setInputVisible(visible bool, reveal bool) {
+	_ = reveal
 	if p.inputVisible == visible {
 		return
 	}
@@ -143,21 +166,6 @@ func (p *chatPane) setInputVisible(visible bool, reveal bool) {
 	}
 	p.inputVisible = visible
 	if visible {
-		if reveal {
-			revealSpacer := canvas.NewRectangle(color.Transparent)
-			start := float32(14)
-			revealSpacer.SetMinSize(fyne.NewSize(1, start))
-			p.viewport.Objects = []fyne.CanvasObject{p.msgScroll, container.NewVBox(revealSpacer, p.inputCard)}
-			p.panel.Refresh()
-			p.revealAnim = fyne.NewAnimation(130*time.Millisecond, func(f float32) {
-				h := start * (1 - f)
-				revealSpacer.SetMinSize(fyne.NewSize(1, h))
-				p.panel.Refresh()
-			})
-			p.revealAnim.Curve = fyne.AnimationEaseOut
-			p.revealAnim.Start()
-			return
-		}
 		p.viewport.Objects = []fyne.CanvasObject{p.msgScroll, p.inputCard}
 	} else {
 		hiddenSpacer := canvas.NewRectangle(color.Transparent)
@@ -165,17 +173,15 @@ func (p *chatPane) setInputVisible(visible bool, reveal bool) {
 		p.viewport.Objects = []fyne.CanvasObject{p.msgScroll, hiddenSpacer}
 	}
 	p.panel.Refresh()
-	for _, d := range []time.Duration{0, 80 * time.Millisecond, 180 * time.Millisecond, 320 * time.Millisecond} {
-		d := d
-		go func() {
-			if d > 0 {
-				time.Sleep(d)
-			}
-			fyne.Do(func() {
-				p.msgScroll.ScrollToBottom()
-			})
-		}()
-	}
+	fyne.Do(func() {
+		p.msgScroll.ScrollToBottom()
+	})
+	go func() {
+		time.Sleep(90 * time.Millisecond)
+		fyne.Do(func() {
+			p.msgScroll.ScrollToBottom()
+		})
+	}()
 }
 
 func (p *chatPane) clearMessages() {
@@ -185,34 +191,59 @@ func (p *chatPane) clearMessages() {
 
 func (p *chatPane) refreshForTheme() {
 	if p.inputBg != nil {
-		p.inputBg.FillColor = theme.Color(theme.ColorNameInputBackground)
+		p.inputBg.FillColor = color.Transparent
 		p.inputBg.Refresh()
+	}
+	if p.inputBorder != nil {
+		p.inputBorder.StrokeColor = color.Transparent
+		p.inputBorder.StrokeWidth = 0
+		p.inputBorder.Refresh()
+	}
+	if p.threadBg != nil {
+		p.threadBg.FillColor = theme.Color(theme.ColorNameHover)
+		p.threadBg.Refresh()
+	}
+	if p.replyBg != nil {
+		p.replyBg.FillColor = theme.Color(theme.ColorNameHover)
+		p.replyBg.Refresh()
 	}
 	p.replyLabel.Refresh()
 	p.threadLabel.Refresh()
+	p.hintLabel.Refresh()
 	p.title.Refresh()
 	p.msgBox.Refresh()
 	p.panel.Refresh()
 }
 
-func (p *chatPane) setMessages(msgs []api.Message, currentUserID, selfUserID string, onThread func(api.Message), onReply func(api.Message), onMedia func(api.File)) {
+func (p *chatPane) setMessages(msgs []api.Message, currentUserID, selfUserID string, showTimestamps bool, onThread func(api.Message), onReply func(api.Message), onMedia func(api.File)) {
 	p.msgBox.Objects = nil
 	inThreadView := strings.TrimSpace(p.threadTS) != ""
+	if len(msgs) == 0 {
+		empty := widget.NewLabel("No messages yet")
+		empty.Importance = widget.LowImportance
+		empty.Wrapping = fyne.TextWrapWord
+		p.msgBox.Add(container.NewPadded(empty))
+		p.msgBox.Refresh()
+		return
+	}
 	for i, m := range msgs {
-		showHeader := isLastInSenderGroup(msgs, i)
 		isFromMe := strings.TrimSpace(m.UserID) != "" && strings.TrimSpace(m.UserID) == strings.TrimSpace(currentUserID)
+		showHeader := isLastInSenderGroup(msgs, i)
+		if isFromMe {
+			// Always show own sender header so the name appears above outgoing text.
+			showHeader = true
+		}
 		mentionedMe := messageMentionsUser(m.Text, selfUserID)
-		p.msgBox.Add(renderMessageRow(m, isFromMe, mentionedMe, onThread, onReply, onMedia, showHeader, inThreadView))
+		p.msgBox.Add(renderMessageRow(m, isFromMe, mentionedMe, showTimestamps, onThread, onReply, onMedia, showHeader, inThreadView))
 	}
 	p.msgBox.Refresh()
-	for _, d := range []time.Duration{0, 60 * time.Millisecond, 200 * time.Millisecond, 500 * time.Millisecond, 900 * time.Millisecond, 1400 * time.Millisecond} {
-		go func(delay time.Duration) {
-			if delay > 0 {
-				time.Sleep(delay)
-			}
-			fyne.Do(func() {
-				p.msgScroll.ScrollToBottom()
-			})
-		}(d)
-	}
+	fyne.Do(func() {
+		p.msgScroll.ScrollToBottom()
+	})
+	go func() {
+		time.Sleep(120 * time.Millisecond)
+		fyne.Do(func() {
+			p.msgScroll.ScrollToBottom()
+		})
+	}()
 }

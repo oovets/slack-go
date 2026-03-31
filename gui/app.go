@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"image"
+	"image/color"
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,15 +24,20 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/stefan/slack-gui/api"
 )
 
 const appID = "com.bluebubbles-tui.slackgui"
 
+var privateChannelLockIcon = fyne.NewStaticResource("private-lock.svg", []byte(`<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#8f96ab" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2" ry="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>`))
+
 // Preference keys for persistent UI state.
 const (
 	prefShowChatList    = "ui.show_chat_list"
+	prefShowTimestamps  = "ui.show_timestamps"
 	prefCompactMode     = "ui.compact_mode"
 	prefDarkMode        = "ui.dark_mode"
 	prefFontSize        = "ui.font_size"
@@ -40,6 +47,7 @@ const (
 	prefWindowHeight    = "ui.window_height"
 	prefPaneLayoutState = "ui.pane_layout_state"
 	prefPaneSeparators  = "ui.pane_separators"
+	prefFavorites       = "ui.favorites"
 )
 
 // Section keys for the sidebar channel list.
@@ -55,9 +63,10 @@ const (
 // Timing constants for scroll-to-bottom retries after layout changes.
 // Multiple attempts are needed because Fyne lays out widgets asynchronously.
 const (
-	reloadDebounce       = 250 * time.Millisecond
-	realtimeStartupDelay = 700 * time.Millisecond
-	postSendRefreshDelay = 130 * time.Millisecond
+	reloadDebounce        = 250 * time.Millisecond
+	realtimeStartupDelay  = 700 * time.Millisecond
+	postSendRefreshDelay  = 130 * time.Millisecond
+	sidebarSearchDebounce = 90 * time.Millisecond
 )
 
 // Image preview window dimensions.
@@ -70,20 +79,20 @@ const (
 
 // App is the top-level application controller. All fields are accessed only
 // from the Fyne main goroutine (via fyne.Do) except paneReloadMu/paneReloadTimers
-// which are protected by paneReloadMu, and realtimeStop/realtimeStopOnce which
-// are written once before the goroutine starts.
+// and realtimeMu/realtimeStop/realtimeRunning, which are protected by mutexes.
 type App struct {
-	client       *api.Client
-	info         *api.AuthInfo
-	appToken     string
-	users        map[string]string
-	userByHandle map[string]string
-	userByID     map[string]string
-	userInfoByID map[string]api.UserInfo
+	client         *api.Client
+	info           *api.AuthInfo
+	appToken       string
+	users          map[string]string
+	userByHandle   map[string]string
+	userByID       map[string]string
+	userInfoByID   map[string]api.UserInfo
 	groupNameCache map[string]string
 
-	realtimeStop     chan struct{}
-	realtimeStopOnce sync.Once
+	realtimeStop    chan struct{}
+	realtimeRunning bool
+	realtimeMu      sync.Mutex
 	// paneReloadMu protects paneReloadTimers, which is written from timer goroutines.
 	paneReloadMu     sync.Mutex
 	paneReloadTimers map[int]*time.Timer
@@ -94,21 +103,35 @@ type App struct {
 
 	channels         []api.Channel
 	channelByID      map[string]api.Channel
+	favorites        map[string]bool
 	listItems        []chatListItem
 	recentThreads    []threadListEntry
 	sectionCollapsed map[string]bool
 
-	channelSearch *widget.Entry
-	channelList   *widget.List
-	chatListPane  *fixedWidthWrap
-	rootContent   *fyne.Container
-	showChatList  bool
+	channelSearch      *widget.Entry
+	channelList        *widget.List
+	chatListPane       *fixedWidthWrap
+	rootContent        *fyne.Container
+	statusLabel        *widget.Label
+	statusActionButton *widget.Button
+	statusActionLabel  string
+	statusActionFn     func()
+	showChatList       bool
+	showTimestamps     bool
 
 	paneManager *paneManager
 
 	windowWidth        float32
 	windowHeight       float32
 	showPaneSeparators bool
+
+	selectedChannelID        string
+	selectedThreadTS         string
+	isProgrammaticListSelect bool
+	suppressSidebarSelect    bool
+	sidebarHoverListID       int
+	statusClearTimer         *time.Timer
+	sidebarSearchTimer       *time.Timer
 
 	initialChannelID string
 	initialThreadTS  string
@@ -129,23 +152,34 @@ type threadListEntry struct {
 	LastActivity time.Time
 }
 
+type quickSwitchItem struct {
+	label    string
+	subtitle string
+	kind     string
+	channel  api.Channel
+	thread   *threadListEntry
+	unread   bool
+}
+
 func New(c *api.Client, info *api.AuthInfo, appToken string) *App {
 	return &App{
-		client:           c,
-		info:             info,
-		appToken:         strings.TrimSpace(appToken),
-		users:            map[string]string{},
-		userByHandle:     map[string]string{},
-		userByID:         map[string]string{},
-		userInfoByID:     map[string]api.UserInfo{},
-		groupNameCache:   map[string]string{},
-		paneReloadTimers: map[int]*time.Timer{},
-		channelByID:      map[string]api.Channel{},
-		showChatList:     true,
+		client:             c,
+		info:               info,
+		appToken:           strings.TrimSpace(appToken),
+		users:              map[string]string{},
+		userByHandle:       map[string]string{},
+		userByID:           map[string]string{},
+		userInfoByID:       map[string]api.UserInfo{},
+		groupNameCache:     map[string]string{},
+		paneReloadTimers:   map[int]*time.Timer{},
+		channelByID:        map[string]api.Channel{},
+		favorites:          map[string]bool{},
+		showChatList:       true,
 		showPaneSeparators: true,
-		windowWidth:      896,
-		windowHeight:     820,
-		sectionCollapsed: map[string]bool{},
+		windowWidth:        896,
+		windowHeight:       820,
+		sectionCollapsed:   map[string]bool{},
+		sidebarHoverListID: -1,
 	}
 }
 
@@ -165,7 +199,10 @@ func (a *App) Run() {
 
 	a.buildSidebar()
 	a.paneManager = newPaneManager(
-		func(p *chatPane) { a.focusPaneInput(p) },
+		func(p *chatPane) {
+			a.syncSidebarSelectionToFocusedPane(p)
+			a.focusPaneInput(p)
+		},
 		func() *chatPane {
 			return newChatPane(
 				func(cp *chatPane) { a.paneManager.setFocus(cp) },
@@ -179,10 +216,24 @@ func (a *App) Run() {
 	)
 	a.paneManager.setShowSeparators(a.showPaneSeparators)
 	a.restorePaneLayoutState()
-
-	a.rootContent = container.NewBorder(nil, nil, a.chatListPane, nil, a.paneManager.widget())
+	a.statusLabel = widget.NewLabel("Ready")
+	a.statusLabel.Importance = widget.LowImportance
+	a.statusActionButton = widget.NewButton("", func() {
+		a.invokeStatusAction()
+	})
+	a.statusActionButton.Importance = widget.LowImportance
+	a.statusActionButton.Hide()
+	statusBarInner := container.NewBorder(nil, nil, a.statusLabel, a.statusActionButton, nil)
+	statusBar := container.NewPadded(statusBarInner)
+	settingsButton := widget.NewButtonWithIcon("", theme.MenuDropDownIcon(), func() {
+		a.openSettingsMenu()
+	})
+	settingsButton.Importance = widget.LowImportance
+	settingsWrap := container.NewGridWrap(fyne.NewSize(18, 18), settingsButton)
+	topBar := container.NewPadded(container.NewHBox(layout.NewSpacer(), settingsWrap))
+	mainArea := container.NewBorder(nil, statusBar, a.chatListPane, nil, a.paneManager.widget())
+	a.rootContent = container.NewBorder(topBar, nil, nil, nil, mainArea)
 	a.win.SetContent(a.rootContent)
-	a.win.SetMainMenu(a.buildMainMenu())
 	a.registerShortcuts()
 	a.fyneApp.Lifecycle().SetOnExitedForeground(func() {
 		fyne.Do(func() {
@@ -197,6 +248,10 @@ func (a *App) Run() {
 	})
 	a.win.SetOnClosed(func() {
 		a.stopRealtimeUpdates()
+		if a.sidebarSearchTimer != nil {
+			a.sidebarSearchTimer.Stop()
+			a.sidebarSearchTimer = nil
+		}
 		a.saveWindowSizePreference()
 		a.savePaneLayoutState()
 	})
@@ -204,6 +259,7 @@ func (a *App) Run() {
 	if err := a.loadInitialData(); err != nil {
 		dialog.ShowError(err, a.win)
 	}
+	a.setStatusTemporary("Ready", 2*time.Second)
 	a.applyInitialOpen()
 	a.refreshPaneTitles()
 	a.focusPaneInput(a.paneManager.focusedPane())
@@ -217,48 +273,141 @@ func (a *App) Run() {
 func (a *App) buildSidebar() {
 	a.channelSearch = widget.NewEntry()
 	a.channelSearch.SetPlaceHolder("Search chats…")
-	a.channelSearch.OnChanged = func(_ string) { a.rebuildFilteredChannels() }
+	a.channelSearch.OnChanged = func(_ string) { a.scheduleSidebarFilterRebuild() }
 
 	a.channelList = widget.NewList(
 		func() int { return len(a.listItems) },
 		func() fyne.CanvasObject {
+			bg := canvas.NewRectangle(color.Transparent)
+			accent := canvas.NewRectangle(color.Transparent)
+			accent.SetMinSize(fyne.NewSize(3, 1))
+			lock := canvas.NewImageFromResource(privateChannelLockIcon)
+			lock.FillMode = canvas.ImageFillContain
+			lock.SetMinSize(fyne.NewSize(7, 7))
+			lock.Hide()
+			lockWrap := container.NewGridWrap(fyne.NewSize(7, 7), lock)
 			lbl := widget.NewLabel("channel")
 			lbl.Wrapping = fyne.TextTruncate
-			return lbl
+			fav := newGlyph("☆", nil)
+			fav.text.TextSize = 9
+			fav.Hide()
+			favWrap := container.NewGridWrap(fyne.NewSize(12, 12), fav)
+			labelWrap := container.NewBorder(nil, nil, sidebarHSpacer(1), sidebarHSpacer(4), lbl)
+			content := container.NewBorder(nil, nil, container.NewHBox(accent, lockWrap), favWrap, labelWrap)
+			return newSidebarHoverRow(container.NewMax(bg, content), nil)
 		},
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
+			bg, accent, lbl, fav, lock, hover := sidebarRowParts(obj)
+			if bg == nil || accent == nil || lbl == nil || fav == nil || lock == nil || hover == nil {
+				return
+			}
 			if id < 0 || id >= len(a.listItems) {
 				return
 			}
 			item := a.listItems[id]
+			hover.onHover = nil
+			fav.Hide()
+			lock.Hide()
+			bg.FillColor = color.Transparent
+			accent.FillColor = color.Transparent
 			if item.channel == nil && item.thread == nil {
-				obj.(*widget.Label).TextStyle = fyne.TextStyle{Bold: true}
-				obj.(*widget.Label).SetText(a.sectionHeaderLabel(item.sectionKey, item.header))
+				if strings.TrimSpace(item.sectionKey) == "" {
+					lbl.TextStyle = fyne.TextStyle{Bold: true}
+					lbl.SetText(strings.ToUpper(strings.TrimSpace(item.header)))
+				} else {
+					lbl.TextStyle = fyne.TextStyle{Bold: true}
+					lbl.SetText(a.sectionHeaderLabel(item.sectionKey, item.header, a.sectionItemCount(item.sectionKey)))
+				}
 				return
 			}
-			obj.(*widget.Label).TextStyle = fyne.TextStyle{}
+			lbl.TextStyle = fyne.TextStyle{}
 			if item.channel != nil {
-				obj.(*widget.Label).SetText(a.chatListLabel(*item.channel))
+				channelID := strings.TrimSpace(item.channel.ID)
+				isFav := a.isFavorite(channelID)
+				isPrivate := item.channel.IsPrivate && !item.channel.IsIM && !item.channel.IsMPIM
+				selected := strings.TrimSpace(a.selectedChannelID) == strings.TrimSpace(item.channel.ID) && strings.TrimSpace(a.selectedThreadTS) == ""
+				lbl.TextStyle = fyne.TextStyle{Bold: selected || a.channelHasUnread(*item.channel)}
+				prefix := ""
+				if selected {
+					bg.FillColor = theme.Color(theme.ColorNameHover)
+				}
+				if isFav {
+					fav.text.Text = "★"
+					fav.text.Color = theme.Color(theme.ColorNamePrimary)
+				} else {
+					fav.text.Text = "☆"
+					fav.text.Color = theme.Color(theme.ColorNameDisabled)
+				}
+				fav.onTap = func() {
+					a.suppressSidebarSelect = true
+					a.toggleFavoriteChannel(channelID)
+				}
+				if isFav || a.sidebarHoverListID == id {
+					fav.Show()
+				} else {
+					fav.Hide()
+				}
+				if isPrivate && a.sidebarHoverListID == id {
+					lock.Show()
+				} else {
+					lock.Hide()
+				}
+				hover.onHover = func(in bool) {
+					if in {
+						if a.sidebarHoverListID != id {
+							a.sidebarHoverListID = id
+							a.channelList.Refresh()
+						}
+						return
+					}
+					if a.sidebarHoverListID == id {
+						a.sidebarHoverListID = -1
+						a.channelList.Refresh()
+					}
+				}
+				fav.Refresh()
+				lbl.SetText(prefix + a.chatListLabel(*item.channel))
 				return
 			}
-			obj.(*widget.Label).SetText("↳ " + strings.TrimSpace(item.thread.Title))
+			selected := strings.TrimSpace(a.selectedThreadTS) == strings.TrimSpace(item.thread.ThreadTS) && strings.TrimSpace(a.selectedChannelID) == strings.TrimSpace(item.thread.ChannelID)
+			lbl.TextStyle = fyne.TextStyle{Italic: !selected, Bold: selected}
+			prefix := "↳ "
+			if selected {
+				bg.FillColor = theme.Color(theme.ColorNameHover)
+			}
+			lbl.SetText(prefix + strings.TrimSpace(item.thread.Title))
 		},
 	)
+	a.channelList.HideSeparators = true
 	a.channelList.OnSelected = func(id widget.ListItemID) {
+		if a.suppressSidebarSelect {
+			a.suppressSidebarSelect = false
+			a.channelList.Unselect(id)
+			return
+		}
+		if a.isProgrammaticListSelect {
+			return
+		}
 		if id < 0 || id >= len(a.listItems) {
 			return
 		}
 		item := a.listItems[id]
 		if item.channel == nil && item.thread == nil {
+			if strings.TrimSpace(item.sectionKey) == "" {
+				a.channelList.Unselect(id)
+				return
+			}
 			a.toggleSection(item.sectionKey)
 			a.channelList.Unselect(id)
 			return
 		}
 		if item.channel == nil && item.thread != nil {
+			a.setSelectedSidebarThread(item.thread.ChannelID, item.thread.ThreadTS)
 			a.openThreadFromList(*item.thread)
 			a.channelList.Unselect(id)
 			return
 		}
+		a.setSelectedSidebarChannel(item.channel.ID)
 		a.assignChannelToFocusedPane(item.channel.ID)
 	}
 
@@ -267,15 +416,77 @@ func (a *App) buildSidebar() {
 		nil, nil, nil,
 		a.channelList,
 	)
-	a.chatListPane = newFixedWidthWrap(left, 130)
+	a.chatListPane = newFixedWidthWrap(left, 106)
 	a.chatListPane.show = a.showChatList
 }
 
+func sidebarRowParts(obj fyne.CanvasObject) (bg *canvas.Rectangle, accent *canvas.Rectangle, lbl *widget.Label, fav *glyph, lock *canvas.Image, hover *sidebarHoverRow) {
+	rects := make([]*canvas.Rectangle, 0, 2)
+	var walk func(fyne.CanvasObject)
+	walk = func(cur fyne.CanvasObject) {
+		if cur == nil {
+			return
+		}
+		switch v := cur.(type) {
+		case *canvas.Rectangle:
+			rects = append(rects, v)
+		case *canvas.Image:
+			if lock == nil {
+				lock = v
+			}
+		case *widget.Label:
+			if lbl == nil {
+				lbl = v
+			}
+		case *glyph:
+			if fav == nil {
+				fav = v
+			}
+		case *sidebarHoverRow:
+			if hover == nil {
+				hover = v
+			}
+			walk(v.content)
+		case *fyne.Container:
+			for _, child := range v.Objects {
+				walk(child)
+			}
+		}
+	}
+	walk(obj)
+	if len(rects) > 0 {
+		bg = rects[0]
+	}
+	if len(rects) > 1 {
+		accent = rects[1]
+	}
+	return bg, accent, lbl, fav, lock, hover
+}
+
+func sidebarHSpacer(width float32) fyne.CanvasObject {
+	r := canvas.NewRectangle(color.Transparent)
+	r.SetMinSize(fyne.NewSize(width, 1))
+	return r
+}
+
 func (a *App) loadInitialData() error {
+	a.setStatus("Loading channels...")
+	emojiNotice := ""
 	if dir, err := a.client.UserDirectory(); err != nil {
 		log.Printf("[SLACK-GUI] users directory failed: %v", err)
 	} else {
 		a.buildUserDirectory(dir)
+	}
+	if emojiMap, err := a.client.EmojiList(); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "missing_scope") {
+			log.Printf("[SLACK-GUI] emoji.list unavailable: missing scope. Add emoji:read in Slack app OAuth & Permissions and reinstall app.")
+			emojiNotice = "emoji.list saknas (emoji:read)"
+		} else {
+			log.Printf("[SLACK-GUI] emoji.list failed: %v", err)
+			emojiNotice = "emoji.list fel"
+		}
+	} else {
+		setWorkspaceEmojiMap(emojiMap)
 	}
 	channels, err := a.client.ListChannels(200)
 	if err != nil {
@@ -299,7 +510,18 @@ func (a *App) loadInitialData() error {
 		}
 	}
 	if idx := a.firstSelectableListIndex(); idx >= 0 {
+		a.isProgrammaticListSelect = true
 		a.channelList.Select(idx)
+		a.isProgrammaticListSelect = false
+		item := a.listItems[idx]
+		if item.channel != nil {
+			a.setSelectedSidebarChannel(item.channel.ID)
+		}
+	}
+	if strings.TrimSpace(emojiNotice) != "" {
+		a.setStatusTemporary("Channels loaded · "+emojiNotice, 6*time.Second)
+	} else {
+		a.setStatusTemporary("Channels loaded", 2*time.Second)
 	}
 	return nil
 }
@@ -426,6 +648,7 @@ func (a *App) resolveGroupParticipantNames(channelID string) []string {
 
 func (a *App) rebuildFilteredChannels() {
 	query := strings.ToLower(strings.TrimSpace(a.channelSearch.Text))
+	favorites := make([]api.Channel, 0)
 	newMsgs := make([]api.Channel, 0)
 	dms := make([]api.Channel, 0)
 	groups := make([]api.Channel, 0)
@@ -441,6 +664,10 @@ func (a *App) rebuildFilteredChannels() {
 		}
 		candidate := strings.ToLower(strings.TrimSpace(a.chatBaseName(ch)))
 		if query != "" && !strings.Contains(candidate, query) {
+			continue
+		}
+		if a.isFavorite(ch.ID) {
+			favorites = append(favorites, ch)
 			continue
 		}
 		if ch.HasUnread || ch.UnreadCount > 0 {
@@ -467,13 +694,8 @@ func (a *App) rebuildFilteredChannels() {
 			threads = append(threads, t)
 		}
 	}
-	sortByName := func(items []api.Channel) {
+	sortByActivity := func(items []api.Channel) {
 		sort.SliceStable(items, func(i, j int) bool {
-			leftUnread := items[i].HasUnread || items[i].UnreadCount > 0
-			rightUnread := items[j].HasUnread || items[j].UnreadCount > 0
-			if leftUnread != rightUnread {
-				return leftUnread
-			}
 			leftLatest := api.ParseSlackTSOrZero(items[i].LatestTS)
 			rightLatest := api.ParseSlackTSOrZero(items[j].LatestTS)
 			if !leftLatest.Equal(rightLatest) {
@@ -495,64 +717,249 @@ func (a *App) rebuildFilteredChannels() {
 			return strings.ToLower(a.chatBaseName(items[i])) < strings.ToLower(a.chatBaseName(items[j]))
 		})
 	}
+	sortByActivity(favorites)
 	sortByLatest(newMsgs)
-	sortByName(dms)
-	sortByName(groups)
-	sortByName(rooms)
-	sortByName(bots)
+	sortByActivity(dms)
+	sortByActivity(groups)
+	sortByActivity(rooms)
+	sortByActivity(bots)
 	sort.SliceStable(threads, func(i, j int) bool {
 		return threads[i].LastActivity.After(threads[j].LastActivity)
 	})
 
 	a.listItems = a.listItems[:0]
-	appendSection := func(key, title string, items []api.Channel) {
-		if len(items) == 0 && key != sectionThreads {
-			return
-		}
-		a.listItems = append(a.listItems, chatListItem{header: title, sectionKey: key})
-		if a.isSectionCollapsed(key) {
-			return
-		}
+	appendSectionHeader := func(title string) {
+		a.listItems = append(a.listItems, chatListItem{header: title, sectionKey: ""})
+	}
+	appendChannels := func(items []api.Channel) {
 		for i := range items {
 			ch := items[i]
 			a.listItems = append(a.listItems, chatListItem{channel: &ch})
 		}
 	}
-	appendSection(sectionNew, "New Messages", newMsgs)
-	appendSection(sectionThreads, "Threads", nil)
-	if !a.isSectionCollapsed(sectionThreads) {
+	if len(favorites) > 0 {
+		appendSectionHeader("Favorites")
+		appendChannels(favorites)
+	}
+	if len(newMsgs) > 0 {
+		appendSectionHeader("New")
+		appendChannels(newMsgs)
+	}
+	if len(rooms) > 0 {
+		appendSectionHeader("Channels")
+		appendChannels(rooms)
+	}
+	if len(threads) > 0 {
+		appendSectionHeader("Threads")
 		for i := range threads {
 			t := threads[i]
 			a.listItems = append(a.listItems, chatListItem{thread: &t})
 		}
 	}
-	appendSection(sectionDMs, "Direct Messages", dms)
-	appendSection(sectionGroups, "Group Chats", groups)
-	appendSection(sectionRooms, "Channels", rooms)
-	appendSection(sectionBots, "Bots & Apps", bots)
+	if len(dms) > 0 {
+		appendSectionHeader("Direct Messages")
+		appendChannels(dms)
+	}
+	if len(groups) > 0 {
+		appendSectionHeader("Groups")
+		appendChannels(groups)
+	}
+	if len(bots) > 0 {
+		appendSectionHeader("Bots & Apps")
+		appendChannels(bots)
+	}
+	if len(a.listItems) == 0 {
+		a.listItems = append(a.listItems, chatListItem{header: "No chats match your search", sectionKey: ""})
+	}
+	a.updateChatListWidth()
 	if a.channelList != nil {
 		a.channelList.Refresh()
+		a.syncSidebarSelection()
 	}
 }
 
-func (a *App) chatListLabel(ch api.Channel) string {
-	unread := ""
-	if ch.UnreadCount > 0 {
-		unread = fmt.Sprintf(" ● %d", ch.UnreadCount)
-	} else if ch.HasUnread {
-		unread = " ●"
+func (a *App) scheduleSidebarFilterRebuild() {
+	if a.sidebarSearchTimer != nil {
+		a.sidebarSearchTimer.Stop()
 	}
+	a.sidebarSearchTimer = time.AfterFunc(sidebarSearchDebounce, func() {
+		fyne.Do(func() {
+			a.rebuildFilteredChannels()
+		})
+	})
+}
+
+func (a *App) updateChatListWidth() {
+	if a.chatListPane == nil {
+		return
+	}
+	const (
+		minWidth  = float32(92)
+		maxWidth  = float32(134)
+		charWidth = float32(6.0)
+		padding   = float32(28)
+	)
+	target := minWidth
+	for _, item := range a.listItems {
+		label := ""
+		switch {
+		case item.channel != nil:
+			label = a.chatListWidthLabel(*item.channel)
+		case item.thread != nil:
+			label = "↳ " + strings.TrimSpace(item.thread.Title)
+		default:
+			label = strings.TrimSpace(item.header)
+		}
+		if label == "" {
+			continue
+		}
+		runes := []rune(label)
+		if len(runes) > 30 {
+			runes = runes[:30]
+		}
+		w := float32(len(runes))*charWidth + padding
+		if w > target {
+			target = w
+		}
+	}
+	if target > maxWidth {
+		target = maxWidth
+	}
+	if target < minWidth {
+		target = minWidth
+	}
+	if a.chatListPane.width == target {
+		return
+	}
+	a.chatListPane.width = target
+	a.chatListPane.Refresh()
+	if a.rootContent != nil {
+		a.rootContent.Refresh()
+	}
+}
+
+func (a *App) chatListWidthLabel(ch api.Channel) string {
+	name := a.chatBaseName(ch)
 	if ch.IsIM {
-		return "@ " + a.chatBaseName(ch) + unread
+		return "@ " + name
 	}
 	if ch.IsMPIM {
-		return "◉ " + a.chatBaseName(ch) + unread
+		return "• " + name
+	}
+	if strings.TrimSpace(name) == "" {
+		name = "channel"
+	}
+	return name
+}
+
+func (a *App) chatListLabel(ch api.Channel) string {
+	marker := ""
+	if a.channelHasUnread(ch) {
+		marker = "● "
+	}
+	unread := ""
+	if ch.UnreadCount > 0 {
+		unread = fmt.Sprintf("  [%d]", ch.UnreadCount)
+	} else if ch.HasUnread {
+		unread = "  [new]"
+	}
+	if ch.IsIM {
+		return marker + "@ " + a.chatBaseName(ch) + unread
+	}
+	if ch.IsMPIM {
+		return marker + "• " + a.chatBaseName(ch) + unread
 	}
 	name := a.chatBaseName(ch)
 	if name == "" {
 		name = "channel"
 	}
-	return "# " + name + unread
+	return marker + name + unread
+}
+
+func (a *App) isFavorite(channelID string) bool {
+	id := strings.TrimSpace(channelID)
+	if id == "" {
+		return false
+	}
+	if a.favorites == nil {
+		a.favorites = map[string]bool{}
+	}
+	return a.favorites[id]
+}
+
+func (a *App) toggleFavoriteFocusedChat() {
+	if a.paneManager == nil {
+		return
+	}
+	p := a.paneManager.focusedPane()
+	if p == nil || strings.TrimSpace(p.channelID) == "" {
+		a.setStatusTemporary("No focused chat to favorite", 2*time.Second)
+		return
+	}
+	a.toggleFavoriteChannel(p.channelID)
+}
+
+func (a *App) toggleFavoriteChannel(channelID string) {
+	id := strings.TrimSpace(channelID)
+	if id == "" {
+		return
+	}
+	if a.favorites == nil {
+		a.favorites = map[string]bool{}
+	}
+	if a.favorites[id] {
+		delete(a.favorites, id)
+		a.setStatusTemporary("Removed from favorites", 2*time.Second)
+	} else {
+		a.favorites[id] = true
+		a.setStatusTemporary("Added to favorites", 2*time.Second)
+	}
+	a.saveFavoritesPreference()
+	a.rebuildFilteredChannels()
+}
+
+func (a *App) saveFavoritesPreference() {
+	if a.fyneApp == nil {
+		return
+	}
+	ids := make([]string, 0, len(a.favorites))
+	for id, enabled := range a.favorites {
+		if !enabled {
+			continue
+		}
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	a.fyneApp.Preferences().SetString(prefFavorites, strings.Join(ids, ","))
+}
+
+func (a *App) channelHasUnread(ch api.Channel) bool {
+	return ch.UnreadCount > 0 || ch.HasUnread
+}
+
+func (a *App) sectionItemCount(section string) int {
+	for i, item := range a.listItems {
+		if item.channel != nil || item.thread != nil {
+			continue
+		}
+		if item.sectionKey != section {
+			continue
+		}
+		count := 0
+		for j := i + 1; j < len(a.listItems); j++ {
+			next := a.listItems[j]
+			if next.channel == nil && next.thread == nil {
+				break
+			}
+			count++
+		}
+		return count
+	}
+	return 0
 }
 
 func (a *App) chatBaseName(ch api.Channel) string {
@@ -665,41 +1072,60 @@ func (a *App) assignChannelToFocusedPane(channelID string) {
 	p.replyTarget = nil
 	p.setTitle(fmt.Sprintf("%s%s — %s", a.chatPrefix(ch), p.channelName, a.info.TeamName))
 	p.input.SetPlaceHolder(a.chatInputPlaceholder(ch))
+	a.setSelectedSidebarChannel(channelID)
 	p.clearMessages()
 	a.clearChannelUnreadState(channelID)
 	a.focusPaneInput(p)
 	a.schedulePaneScrollToBottom(p)
 	a.savePaneLayoutState()
+	a.setStatusTemporary("Switched to "+a.chatPrefix(ch)+p.channelName, 3*time.Second)
 	go a.loadMessagesForPane(p)
 }
 
 func (a *App) clearChannelUnreadState(channelID string) {
+	changed := false
 	for i := range a.channels {
 		if strings.TrimSpace(a.channels[i].ID) != strings.TrimSpace(channelID) {
 			continue
+		}
+		if !a.channels[i].HasUnread && a.channels[i].UnreadCount == 0 {
+			break
 		}
 		a.channels[i].HasUnread = false
 		a.channels[i].UnreadCount = 0
 		a.channelByID[channelID] = a.channels[i]
+		changed = true
 		break
 	}
-	a.rebuildFilteredChannels()
+	if changed {
+		a.rebuildFilteredChannels()
+	}
 }
 
 func (a *App) markChannelUnreadState(channelID, latestTS string) {
+	changed := false
 	for i := range a.channels {
 		if strings.TrimSpace(a.channels[i].ID) != strings.TrimSpace(channelID) {
 			continue
 		}
+		if !a.channels[i].HasUnread {
+			changed = true
+		}
 		a.channels[i].HasUnread = true
 		a.channels[i].UnreadCount++
+		changed = true
 		if strings.TrimSpace(latestTS) != "" {
-			a.channels[i].LatestTS = latestTS
+			if strings.TrimSpace(a.channels[i].LatestTS) != strings.TrimSpace(latestTS) {
+				a.channels[i].LatestTS = latestTS
+				changed = true
+			}
 		}
 		a.channelByID[channelID] = a.channels[i]
 		break
 	}
-	a.rebuildFilteredChannels()
+	if changed {
+		a.rebuildFilteredChannels()
+	}
 }
 
 func (a *App) focusedPaneShowingChannel(channelID string) bool {
@@ -736,6 +1162,23 @@ func (a *App) loadMessagesForPane(p *chatPane) {
 			return
 		}
 		if err != nil {
+			if delay, rateLimited := retryDelayForError(err); rateLimited {
+				secs := int(delay / time.Second)
+				a.setStatusWithAction(
+					"Rate limited while loading",
+					fmt.Sprintf("Retry in %ds", secs),
+					func() {
+						go func() {
+							time.Sleep(delay)
+							a.loadMessagesForPane(p)
+						}()
+					},
+				)
+			} else {
+				a.setStatusWithAction("Failed to load messages", "Retry", func() {
+					go a.loadMessagesForPane(p)
+				})
+			}
 			dialog.ShowError(err, a.win)
 			return
 		}
@@ -751,7 +1194,7 @@ func (a *App) loadMessagesForPane(p *chatPane) {
 			msgs[i].Text = a.formatMentionsForDisplay(msgs[i].Text)
 			msgs[i].ForwardedText = a.formatMentionsForDisplay(msgs[i].ForwardedText)
 		}
-		p.setMessages(msgs, a.info.UserID, a.info.UserID, func(m api.Message) {
+		p.setMessages(msgs, a.info.UserID, a.info.UserID, a.showTimestamps, func(m api.Message) {
 			a.openThreadInPane(p, m)
 		}, func(m api.Message) {
 			a.setReplyTarget(p, m)
@@ -769,7 +1212,7 @@ func (a *App) schedulePaneScrollToBottom(p *chatPane) {
 	if p == nil {
 		return
 	}
-	for _, d := range []time.Duration{0, 40 * time.Millisecond, 100 * time.Millisecond, 220 * time.Millisecond, 420 * time.Millisecond, 800 * time.Millisecond, 1400 * time.Millisecond} {
+	for _, d := range []time.Duration{0, 120 * time.Millisecond} {
 		d := d
 		go func() {
 			if d > 0 {
@@ -788,6 +1231,7 @@ func (a *App) openThreadInPane(p *chatPane, m api.Message) {
 		return
 	}
 	p.threadTS = rootTS
+	a.setSelectedSidebarThread(p.channelID, rootTS)
 	p.replyTarget = nil
 	p.replyHolder.Hide()
 	p.setThreadBanner(fmt.Sprintf("Thread: %s — %s", senderName(m), truncate(strings.TrimSpace(m.Text), 80)))
@@ -802,6 +1246,7 @@ func (a *App) exitThreadInPane(p *chatPane) {
 		return
 	}
 	p.threadTS = ""
+	a.setSelectedSidebarChannel(p.channelID)
 	p.setThreadBanner("")
 	p.replyTarget = nil
 	p.replyHolder.Hide()
@@ -836,16 +1281,234 @@ func (a *App) sendFromPane(p *chatPane) {
 	if p.replyTarget != nil {
 		threadTS = threadRootTS(*p.replyTarget)
 	}
+	var retrySend func()
+	retrySend = func() {
+		if err := a.client.PostMessage(p.channelID, text, threadTS); err != nil {
+			dialog.ShowError(err, a.win)
+			a.setStatusWithAction("Send failed", "Retry send", retrySend)
+			return
+		}
+		a.setStatusTemporary("Message sent", 2*time.Second)
+		p.input.SetText("")
+		a.clearReplyTarget(p)
+		go func() {
+			time.Sleep(postSendRefreshDelay)
+			a.loadMessagesForPane(p)
+		}()
+	}
 	if err := a.client.PostMessage(p.channelID, text, threadTS); err != nil {
+		if delay, rateLimited := retryDelayForError(err); rateLimited {
+			secs := int(delay / time.Second)
+			a.setStatusWithAction(
+				"Rate limited while sending",
+				fmt.Sprintf("Retry in %ds", secs),
+				func() {
+					go func() {
+						time.Sleep(delay)
+						retrySend()
+					}()
+				},
+			)
+		} else {
+			a.setStatusWithAction("Send failed", "Retry send", retrySend)
+		}
 		dialog.ShowError(err, a.win)
 		return
 	}
+	a.setStatusTemporary("Message sent", 2*time.Second)
 	p.input.SetText("")
 	a.clearReplyTarget(p)
 	go func() {
 		time.Sleep(postSendRefreshDelay)
 		a.loadMessagesForPane(p)
 	}()
+}
+
+func (a *App) setSelectedSidebarChannel(channelID string) {
+	channelID = strings.TrimSpace(channelID)
+	if a.selectedChannelID == channelID && a.selectedThreadTS == "" {
+		return
+	}
+	a.selectedChannelID = channelID
+	a.selectedThreadTS = ""
+	if a.channelList != nil {
+		a.channelList.Refresh()
+	}
+}
+
+func (a *App) setSelectedSidebarThread(channelID, threadTS string) {
+	channelID = strings.TrimSpace(channelID)
+	threadTS = strings.TrimSpace(threadTS)
+	if a.selectedChannelID == channelID && a.selectedThreadTS == threadTS {
+		return
+	}
+	a.selectedChannelID = channelID
+	a.selectedThreadTS = threadTS
+	if a.channelList != nil {
+		a.channelList.Refresh()
+	}
+}
+
+func (a *App) syncSidebarSelection() {
+	if a.channelList == nil {
+		return
+	}
+	if strings.TrimSpace(a.selectedThreadTS) != "" {
+		for i, item := range a.listItems {
+			if item.thread == nil {
+				continue
+			}
+			if strings.TrimSpace(item.thread.ChannelID) == strings.TrimSpace(a.selectedChannelID) && strings.TrimSpace(item.thread.ThreadTS) == strings.TrimSpace(a.selectedThreadTS) {
+				a.isProgrammaticListSelect = true
+				a.channelList.Select(i)
+				a.isProgrammaticListSelect = false
+				return
+			}
+		}
+	}
+	if strings.TrimSpace(a.selectedChannelID) == "" {
+		return
+	}
+	for i, item := range a.listItems {
+		if item.channel == nil {
+			continue
+		}
+		if strings.TrimSpace(item.channel.ID) == strings.TrimSpace(a.selectedChannelID) {
+			a.isProgrammaticListSelect = true
+			a.channelList.Select(i)
+			a.isProgrammaticListSelect = false
+			return
+		}
+	}
+}
+
+func (a *App) setStatus(text string) {
+	if a.statusLabel == nil {
+		return
+	}
+	if a.statusClearTimer != nil {
+		a.statusClearTimer.Stop()
+		a.statusClearTimer = nil
+	}
+	a.statusLabel.SetText(strings.TrimSpace(text))
+	a.clearStatusAction()
+}
+
+func (a *App) clearStatusAction() {
+	a.statusActionLabel = ""
+	a.statusActionFn = nil
+	if a.statusActionButton != nil {
+		a.statusActionButton.Hide()
+	}
+}
+
+func (a *App) setStatusAction(label string, fn func()) {
+	if a.statusActionButton == nil {
+		return
+	}
+	label = strings.TrimSpace(label)
+	if label == "" || fn == nil {
+		a.clearStatusAction()
+		return
+	}
+	a.statusActionLabel = label
+	a.statusActionFn = fn
+	a.statusActionButton.SetText(label)
+	a.statusActionButton.Show()
+	a.statusActionButton.Refresh()
+}
+
+func (a *App) invokeStatusAction() {
+	if a.statusActionFn == nil {
+		return
+	}
+	a.statusActionFn()
+}
+
+func (a *App) setStatusTemporary(text string, ttl time.Duration) {
+	if a.statusLabel == nil {
+		return
+	}
+	a.setStatus(text)
+	if ttl <= 0 {
+		return
+	}
+	marker := strings.TrimSpace(text)
+	a.statusClearTimer = time.AfterFunc(ttl, func() {
+		fyne.Do(func() {
+			if a.statusLabel == nil {
+				return
+			}
+			if strings.TrimSpace(a.statusLabel.Text) != marker {
+				return
+			}
+			a.statusLabel.SetText("Ready")
+			a.clearStatusAction()
+		})
+	})
+}
+
+func (a *App) setStatusWithAction(text, actionLabel string, actionFn func()) {
+	a.setStatus(text)
+	a.setStatusAction(actionLabel, actionFn)
+}
+
+func (a *App) setStatusTemporaryWithAction(text string, ttl time.Duration, actionLabel string, actionFn func()) {
+	a.setStatusWithAction(text, actionLabel, actionFn)
+	if ttl <= 0 {
+		return
+	}
+	marker := strings.TrimSpace(text)
+	a.statusClearTimer = time.AfterFunc(ttl, func() {
+		fyne.Do(func() {
+			if a.statusLabel == nil {
+				return
+			}
+			if strings.TrimSpace(a.statusLabel.Text) != marker {
+				return
+			}
+			a.statusLabel.SetText("Ready")
+			a.clearStatusAction()
+		})
+	})
+}
+
+func (a *App) setStatusFromRealtime(text string) {
+	fyne.Do(func() {
+		a.setStatus(text)
+	})
+}
+
+func (a *App) setStatusWithActionFromRealtime(text, actionLabel string, actionFn func()) {
+	fyne.Do(func() {
+		a.setStatusWithAction(text, actionLabel, actionFn)
+	})
+}
+
+func (a *App) setStatusTemporaryFromRealtime(text string, ttl time.Duration) {
+	fyne.Do(func() {
+		a.setStatusTemporary(text, ttl)
+	})
+}
+
+func (a *App) reconnectBackoffStatus(backoff time.Duration) string {
+	return "Realtime disconnected, retry in " + strconv.Itoa(int(backoff/time.Second)) + "s"
+}
+
+func retryDelayForError(err error) (time.Duration, bool) {
+	if err == nil {
+		return 0, false
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	if strings.Contains(msg, "status 429") || strings.Contains(msg, "ratelimited") || strings.Contains(msg, "rate_limited") {
+		return 4 * time.Second, true
+	}
+	return 0, false
+}
+
+func (a *App) restartRealtimeUpdates() {
+	a.stopRealtimeUpdates()
+	a.startRealtimeUpdates()
 }
 
 func (a *App) buildUserDirectory(dir []api.UserInfo) {
@@ -960,12 +1623,15 @@ func (a *App) toggleSection(section string) {
 	a.rebuildFilteredChannels()
 }
 
-func (a *App) sectionHeaderLabel(section, title string) string {
+func (a *App) sectionHeaderLabel(section, title string, count int) string {
 	arrow := "▼"
 	if a.isSectionCollapsed(section) {
 		arrow = "▶"
 	}
-	return fmt.Sprintf("%s %s", arrow, title)
+	if count <= 0 {
+		return fmt.Sprintf("%s %s", arrow, title)
+	}
+	return fmt.Sprintf("%s %s (%d)", arrow, title, count)
 }
 
 func (a *App) openThreadFromList(t threadListEntry) {
@@ -990,6 +1656,262 @@ func (a *App) openThreadFromList(t threadListEntry) {
 	a.schedulePaneScrollToBottom(p)
 	a.savePaneLayoutState()
 	go a.loadMessagesForPane(p)
+}
+
+func (a *App) quickSwitchItems(query string) []quickSwitchItem {
+	q := strings.ToLower(strings.TrimSpace(query))
+	out := make([]quickSwitchItem, 0, len(a.channels)+len(a.recentThreads))
+	for _, ch := range a.channels {
+		if !ch.IsIM && !ch.IsMPIM && !ch.IsMember {
+			continue
+		}
+		name := strings.TrimSpace(a.chatBaseName(ch))
+		if name == "" {
+			continue
+		}
+		if q != "" && !strings.Contains(strings.ToLower(name), q) {
+			continue
+		}
+		prefix := "#"
+		kind := "channel"
+		if ch.IsIM {
+			prefix = "@"
+			kind = "dm"
+		} else if ch.IsMPIM {
+			prefix = "•"
+			kind = "group"
+		}
+		out = append(out, quickSwitchItem{
+			label:    fmt.Sprintf("%s %s", prefix, name),
+			subtitle: strings.ToUpper(kind),
+			kind:     kind,
+			channel:  ch,
+			unread:   a.channelHasUnread(ch),
+		})
+	}
+	for i := range a.recentThreads {
+		t := a.recentThreads[i]
+		label := fmt.Sprintf("↳ %s (%s)", strings.TrimSpace(t.Title), strings.TrimSpace(t.ChannelLabel))
+		if q != "" && !strings.Contains(strings.ToLower(label), q) {
+			continue
+		}
+		tCopy := t
+		out = append(out, quickSwitchItem{
+			label:    label,
+			subtitle: "THREAD",
+			kind:     "thread",
+			thread:   &tCopy,
+			unread:   false,
+		})
+	}
+	rank := func(item quickSwitchItem) int {
+		score := 0
+		lower := strings.ToLower(item.label)
+		if q != "" {
+			if strings.HasPrefix(lower, q) {
+				score += 400
+			} else if strings.Contains(lower, q) {
+				score += 120
+			}
+		}
+		if item.unread {
+			score += 220
+		}
+		if item.kind == "thread" {
+			score -= 30
+		}
+		if strings.TrimSpace(a.selectedChannelID) != "" && strings.TrimSpace(item.channel.ID) == strings.TrimSpace(a.selectedChannelID) {
+			score += 20
+		}
+		return score
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		left := rank(out[i])
+		right := rank(out[j])
+		if left != right {
+			return left > right
+		}
+		return strings.ToLower(out[i].label) < strings.ToLower(out[j].label)
+	})
+	if len(out) > 60 {
+		return out[:60]
+	}
+	return out
+}
+
+func (a *App) openQuickSwitcher() {
+	if a.win == nil {
+		return
+	}
+	items := a.quickSwitchItems("")
+	if len(items) == 0 {
+		dialog.ShowInformation("Quick Switcher", "No channels or threads available yet.", a.win)
+		return
+	}
+
+	var query *quickSwitchEntry
+	status := widget.NewLabel("")
+	status.Importance = widget.LowImportance
+
+	selected := 0
+	var list *widget.List
+	var d dialog.Dialog
+	openSelected := func() {
+		if len(items) == 0 {
+			return
+		}
+		if selected < 0 || selected >= len(items) {
+			selected = 0
+		}
+		item := items[selected]
+		if item.thread != nil {
+			a.setSelectedSidebarThread(item.thread.ChannelID, item.thread.ThreadTS)
+			a.openThreadFromList(*item.thread)
+		} else if strings.TrimSpace(item.channel.ID) != "" {
+			a.setSelectedSidebarChannel(item.channel.ID)
+			a.assignChannelToFocusedPane(item.channel.ID)
+		}
+		if d != nil {
+			d.Hide()
+		}
+	}
+	moveSelected := func(delta int) {
+		if len(items) == 0 {
+			selected = -1
+			list.Refresh()
+			return
+		}
+		if selected < 0 {
+			selected = 0
+		} else {
+			selected += delta
+		}
+		if selected < 0 {
+			selected = len(items) - 1
+		}
+		if selected >= len(items) {
+			selected = 0
+		}
+		list.Select(selected)
+		list.Refresh()
+	}
+	query = newQuickSwitchEntry(moveSelected, openSelected, func() {
+		if d != nil {
+			d.Hide()
+		}
+	})
+	query.SetPlaceHolder("Jump to channel, DM, or thread...")
+
+	list = widget.NewList(
+		func() int { return len(items) },
+		func() fyne.CanvasObject {
+			dot := canvas.NewText("●", theme.Color(theme.ColorNamePrimary))
+			dot.TextSize = theme.CaptionTextSize()
+			title := widget.NewLabel("item")
+			title.Wrapping = fyne.TextTruncate
+			meta := widget.NewLabel("meta")
+			meta.Wrapping = fyne.TextTruncate
+			meta.Importance = widget.LowImportance
+			return container.NewBorder(nil, nil, dot, nil, container.NewVBox(title, meta))
+		},
+		func(id widget.ListItemID, obj fyne.CanvasObject) {
+			if id < 0 || id >= len(items) {
+				return
+			}
+			dot, title, meta := quickSwitchRowParts(obj)
+			if dot == nil || title == nil || meta == nil {
+				return
+			}
+			item := items[id]
+			if item.unread {
+				dot.Color = theme.Color(theme.ColorNamePrimary)
+				meta.SetText(item.subtitle + " • UNREAD")
+			} else {
+				dot.Color = theme.Color(theme.ColorNameDisabled)
+				meta.SetText(item.subtitle)
+			}
+			dot.Refresh()
+			if id == selected {
+				title.TextStyle = fyne.TextStyle{Bold: true}
+				title.SetText("› " + item.label)
+			} else {
+				title.TextStyle = fyne.TextStyle{}
+				title.SetText("  " + item.label)
+			}
+		},
+	)
+	list.OnSelected = func(id widget.ListItemID) {
+		if id >= 0 && id < len(items) {
+			selected = id
+			list.Refresh()
+		}
+	}
+	list.OnUnselected = func(_ widget.ListItemID) {
+		selected = -1
+		list.Refresh()
+	}
+
+	refreshState := func() {
+		count := len(items)
+		if count == 0 {
+			status.SetText("No matches  •  Up/Down or Ctrl+N/Ctrl+P to navigate")
+			selected = -1
+		} else {
+			status.SetText(fmt.Sprintf("%d result(s)  •  Up/Down or Ctrl+N/Ctrl+P  •  Enter to open  •  Esc to close", count))
+			if selected < 0 || selected >= count {
+				selected = 0
+			}
+			list.Select(selected)
+		}
+		list.Refresh()
+	}
+
+	query.OnChanged = func(s string) {
+		items = a.quickSwitchItems(s)
+		refreshState()
+	}
+	query.OnSubmitted = func(_ string) {
+		openSelected()
+	}
+
+	openBtn := widget.NewButton("Open", func() { openSelected() })
+	footer := container.NewBorder(nil, nil, status, openBtn, nil)
+	content := container.NewBorder(query, footer, nil, nil, list)
+	d = dialog.NewCustom("Quick Switcher", "Close", content, a.win)
+	d.Resize(fyne.NewSize(560, 460))
+	d.Show()
+	refreshState()
+	a.win.Canvas().Focus(query)
+}
+
+func quickSwitchRowParts(obj fyne.CanvasObject) (dot *canvas.Text, title *widget.Label, meta *widget.Label) {
+	labels := make([]*widget.Label, 0, 2)
+	var walk func(fyne.CanvasObject)
+	walk = func(cur fyne.CanvasObject) {
+		if cur == nil {
+			return
+		}
+		switch v := cur.(type) {
+		case *canvas.Text:
+			if dot == nil {
+				dot = v
+			}
+		case *widget.Label:
+			labels = append(labels, v)
+		case *fyne.Container:
+			for _, child := range v.Objects {
+				walk(child)
+			}
+		}
+	}
+	walk(obj)
+	if len(labels) > 0 {
+		title = labels[0]
+	}
+	if len(labels) > 1 {
+		meta = labels[1]
+	}
+	return dot, title, meta
 }
 
 var mentionHandleRE = regexp.MustCompile(`(^|[\s(\[{])@([a-zA-Z0-9._-]{1,80})`)
@@ -1096,9 +2018,15 @@ func (a *App) registerShortcuts() {
 	c.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyName("N"), Modifier: fyne.KeyModifierControl}, func(_ fyne.Shortcut) {
 		a.openNewWindow()
 	})
+	c.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyName("K"), Modifier: fyne.KeyModifierControl}, func(_ fyne.Shortcut) {
+		a.openQuickSwitcher()
+	})
+	c.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyName("T"), Modifier: fyne.KeyModifierControl}, func(_ fyne.Shortcut) {
+		a.setShowTimestamps(!a.showTimestamps)
+	})
 }
 
-func (a *App) buildMainMenu() *fyne.MainMenu {
+func (a *App) buildSettingsMenu() *fyne.Menu {
 	colorModeLabel := "Switch to Light Mode"
 	if !a.appTheme.dark {
 		colorModeLabel = "Switch to Dark Mode"
@@ -1106,6 +2034,10 @@ func (a *App) buildMainMenu() *fyne.MainMenu {
 	compactLabel := "Enable Compact Mode"
 	if a.appTheme.compactMode {
 		compactLabel = "Disable Compact Mode"
+	}
+	timestampsLabel := "Show Timestamps"
+	if a.showTimestamps {
+		timestampsLabel = "Hide Timestamps"
 	}
 	separatorLabel := "Hide Pane Separators"
 	if !a.showPaneSeparators {
@@ -1121,7 +2053,6 @@ func (a *App) buildMainMenu() *fyne.MainMenu {
 		}
 		fontItems = append(fontItems, fyne.NewMenuItem(label, func() {
 			a.setFont(n)
-			a.win.SetMainMenu(a.buildMainMenu())
 		}))
 	}
 	fontItem := fyne.NewMenuItem("Font", nil)
@@ -1130,6 +2061,15 @@ func (a *App) buildMainMenu() *fyne.MainMenu {
 	windowMenu := fyne.NewMenu("Window",
 		fyne.NewMenuItem("New Window", func() { a.openNewWindow() }),
 		fyne.NewMenuItem("Move Focused Pane to New Window", func() { a.moveFocusedPaneToNewWindow() }),
+		fyne.NewMenuItem("Quick Switcher", func() { a.openQuickSwitcher() }),
+		fyne.NewMenuItem(func() string {
+			if a.paneManager != nil {
+				if p := a.paneManager.focusedPane(); p != nil && a.isFavorite(p.channelID) {
+					return "Unfavorite Focused Chat"
+				}
+			}
+			return "Favorite Focused Chat"
+		}(), func() { a.toggleFavoriteFocusedChat() }),
 	)
 	viewMenu := fyne.NewMenu("View",
 		fyne.NewMenuItem("A+ Larger", func() {
@@ -1155,12 +2095,39 @@ func (a *App) buildMainMenu() *fyne.MainMenu {
 			a.refreshPanesForTheme()
 		}),
 		fontItem,
+		fyne.NewMenuItem(timestampsLabel, func() { a.setShowTimestamps(!a.showTimestamps) }),
 		fyne.NewMenuItem(separatorLabel, func() { a.togglePaneSeparators() }),
 		fyne.NewMenuItem("Toggle Channel List", func() { a.toggleChatList() }),
 		fyne.NewMenuItem(compactLabel, func() { a.setCompactMode(!a.appTheme.compactMode) }),
 		fyne.NewMenuItem(colorModeLabel, func() { a.setDarkMode(!a.appTheme.dark) }),
 	)
-	return fyne.NewMainMenu(windowMenu, viewMenu)
+	items := make([]*fyne.MenuItem, 0, len(windowMenu.Items)+len(viewMenu.Items)+3)
+	items = append(items, windowMenu.Items...)
+	items = append(items, fyne.NewMenuItemSeparator())
+	items = append(items, viewMenu.Items...)
+	return fyne.NewMenu("", items...)
+}
+
+func (a *App) openSettingsMenu() {
+	if a.win == nil {
+		return
+	}
+	menu := a.buildSettingsMenu()
+	pos := fyne.NewPos(a.win.Canvas().Size().Width-6, 18)
+	widget.ShowPopUpMenuAtPosition(menu, a.win.Canvas(), pos)
+}
+
+func (a *App) syncSidebarSelectionToFocusedPane(p *chatPane) {
+	if p == nil {
+		return
+	}
+	if strings.TrimSpace(p.threadTS) != "" && strings.TrimSpace(p.channelID) != "" {
+		a.setSelectedSidebarThread(p.channelID, p.threadTS)
+		return
+	}
+	if strings.TrimSpace(p.channelID) != "" {
+		a.setSelectedSidebarChannel(p.channelID)
+	}
 }
 
 func (a *App) toggleChatList() {
@@ -1179,16 +2146,12 @@ func (a *App) togglePaneSeparators() {
 	if a.fyneApp != nil {
 		a.fyneApp.Preferences().SetBool(prefPaneSeparators, a.showPaneSeparators)
 	}
-	if a.win != nil {
-		a.win.SetMainMenu(a.buildMainMenu())
-	}
 }
 
 func (a *App) setCompactMode(enabled bool) {
 	a.appTheme.compactMode = enabled
 	a.fyneApp.Preferences().SetBool(prefCompactMode, enabled)
 	a.fyneApp.Settings().SetTheme(a.appTheme)
-	a.win.SetMainMenu(a.buildMainMenu())
 	a.refreshPanesForTheme()
 }
 
@@ -1196,7 +2159,14 @@ func (a *App) setDarkMode(enabled bool) {
 	a.appTheme.dark = enabled
 	a.fyneApp.Preferences().SetBool(prefDarkMode, enabled)
 	a.fyneApp.Settings().SetTheme(a.appTheme)
-	a.win.SetMainMenu(a.buildMainMenu())
+	a.refreshPanesForTheme()
+}
+
+func (a *App) setShowTimestamps(enabled bool) {
+	a.showTimestamps = enabled
+	if a.fyneApp != nil {
+		a.fyneApp.Preferences().SetBool(prefShowTimestamps, enabled)
+	}
 	a.refreshPanesForTheme()
 }
 
@@ -1280,8 +2250,10 @@ func (a *App) applyInitialOpen() {
 	p.channelName = a.chatBaseName(ch)
 	p.threadTS = strings.TrimSpace(a.initialThreadTS)
 	if p.threadTS != "" {
+		a.setSelectedSidebarThread(p.channelID, p.threadTS)
 		p.setThreadBanner("Thread view")
 	} else {
+		a.setSelectedSidebarChannel(p.channelID)
 		p.setThreadBanner("")
 	}
 	p.input.SetPlaceHolder(a.chatInputPlaceholder(ch))
@@ -1315,6 +2287,7 @@ func (a *App) loadUIState() {
 	}
 	prefs := a.fyneApp.Preferences()
 	a.showChatList = prefs.BoolWithFallback(prefShowChatList, true)
+	a.showTimestamps = prefs.BoolWithFallback(prefShowTimestamps, false)
 	a.appTheme.dark = prefs.BoolWithFallback(prefDarkMode, a.appTheme.dark)
 	a.appTheme.compactMode = prefs.BoolWithFallback(prefCompactMode, false)
 	fontSize := prefs.IntWithFallback(prefFontSize, int(a.appTheme.fontSize))
@@ -1334,6 +2307,14 @@ func (a *App) loadUIState() {
 	a.windowWidth = float32(prefs.FloatWithFallback(prefWindowWidth, 896))
 	a.windowHeight = float32(prefs.FloatWithFallback(prefWindowHeight, 820))
 	a.showPaneSeparators = prefs.BoolWithFallback(prefPaneSeparators, true)
+	a.favorites = map[string]bool{}
+	for _, id := range strings.Split(prefs.StringWithFallback(prefFavorites, ""), ",") {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		a.favorites[id] = true
+	}
 	if a.windowWidth < 700 {
 		a.windowWidth = 700
 	}
@@ -1409,6 +2390,12 @@ func (a *App) handleInputShortcut(shortcut fyne.Shortcut) bool {
 		return true
 	case fyne.KeyName("N"):
 		a.openNewWindow()
+		return true
+	case fyne.KeyName("K"):
+		a.openQuickSwitcher()
+		return true
+	case fyne.KeyName("T"):
+		a.setShowTimestamps(!a.showTimestamps)
 		return true
 	}
 	return false

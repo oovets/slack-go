@@ -2,6 +2,7 @@ package gui
 
 import (
 	"image/color"
+	"strings"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -135,9 +136,44 @@ func (s *paneSurface) TappedSecondary(_ *fyne.PointEvent) {
 		s.onActivate()
 	}
 }
-func (s *paneSurface) MouseIn(_ *desktop.MouseEvent)    {}
+func (s *paneSurface) MouseIn(_ *desktop.MouseEvent) {
+	if s.onActivate != nil {
+		s.onActivate()
+	}
+}
 func (s *paneSurface) MouseOut()                        {}
 func (s *paneSurface) MouseMoved(_ *desktop.MouseEvent) {}
+
+// sidebarHoverRow provides hover callbacks for list row content without adding visual chrome.
+type sidebarHoverRow struct {
+	widget.BaseWidget
+	content fyne.CanvasObject
+	onHover func(bool)
+}
+
+func newSidebarHoverRow(content fyne.CanvasObject, onHover func(bool)) *sidebarHoverRow {
+	r := &sidebarHoverRow{content: content, onHover: onHover}
+	r.ExtendBaseWidget(r)
+	return r
+}
+
+func (r *sidebarHoverRow) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(r.content)
+}
+
+func (r *sidebarHoverRow) MouseIn(_ *desktop.MouseEvent) {
+	if r.onHover != nil {
+		r.onHover(true)
+	}
+}
+
+func (r *sidebarHoverRow) MouseOut() {
+	if r.onHover != nil {
+		r.onHover(false)
+	}
+}
+
+func (r *sidebarHoverRow) MouseMoved(_ *desktop.MouseEvent) {}
 
 // glyph is a small icon-like tap target using a text character.
 type glyph struct {
@@ -164,6 +200,108 @@ func (g *glyph) Tapped(_ *fyne.PointEvent) {
 	}
 }
 func (g *glyph) TappedSecondary(_ *fyne.PointEvent) {}
+
+// timestampToggleRow reveals a message timestamp on tap with no hover animation.
+type timestampToggleRow struct {
+	widget.BaseWidget
+	host    *fyne.Container
+	ts      *canvas.Text
+	visible bool
+}
+
+func newTimestampToggleRow(content fyne.CanvasObject, timestamp string, alignRight bool) *timestampToggleRow {
+	ts := canvas.NewText(strings.TrimSpace(timestamp), color.NRGBA{R: 100, G: 106, B: 130, A: 190})
+	ts.TextSize = hoverTimestampTextSize()
+	ts.Hide()
+	tsRow := fyne.CanvasObject(ts)
+	if alignRight {
+		tsRow = alignOutgoingRow(ts, true)
+	}
+	host := container.NewVBox(tsRow, content)
+	r := &timestampToggleRow{host: host, ts: ts}
+	r.ExtendBaseWidget(r)
+	return r
+}
+
+func (r *timestampToggleRow) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(r.host)
+}
+
+func (r *timestampToggleRow) Tapped(_ *fyne.PointEvent) {
+	r.visible = !r.visible
+	if r.visible {
+		r.ts.Show()
+	} else {
+		r.ts.Hide()
+	}
+	r.host.Refresh()
+}
+
+func (r *timestampToggleRow) TappedSecondary(_ *fyne.PointEvent) {}
+
+// quickSwitchEntry adds command-palette style keyboard handling to an Entry.
+type quickSwitchEntry struct {
+	widget.Entry
+	onMove   func(delta int)
+	onSubmit func()
+	onClose  func()
+}
+
+func newQuickSwitchEntry(onMove func(int), onSubmit func(), onClose func()) *quickSwitchEntry {
+	e := &quickSwitchEntry{onMove: onMove, onSubmit: onSubmit, onClose: onClose}
+	e.ExtendBaseWidget(e)
+	return e
+}
+
+func (e *quickSwitchEntry) TypedKey(key *fyne.KeyEvent) {
+	if key == nil {
+		e.Entry.TypedKey(key)
+		return
+	}
+	switch key.Name {
+	case fyne.KeyDown:
+		if e.onMove != nil {
+			e.onMove(1)
+			return
+		}
+	case fyne.KeyUp:
+		if e.onMove != nil {
+			e.onMove(-1)
+			return
+		}
+	case fyne.KeyReturn, fyne.KeyEnter:
+		if e.onSubmit != nil {
+			e.onSubmit()
+			return
+		}
+	case fyne.KeyEscape:
+		if e.onClose != nil {
+			e.onClose()
+			return
+		}
+	}
+	e.Entry.TypedKey(key)
+}
+
+func (e *quickSwitchEntry) TypedShortcut(shortcut fyne.Shortcut) {
+	custom, ok := shortcut.(*desktop.CustomShortcut)
+	if ok && custom.Modifier&fyne.KeyModifierControl != 0 {
+		key := fyne.KeyName(strings.ToUpper(string(custom.KeyName)))
+		switch key {
+		case fyne.KeyName("N"), fyne.KeyName("J"):
+			if e.onMove != nil {
+				e.onMove(1)
+				return
+			}
+		case fyne.KeyName("P"), fyne.KeyName("K"):
+			if e.onMove != nil {
+				e.onMove(-1)
+				return
+			}
+		}
+	}
+	e.Entry.TypedShortcut(shortcut)
+}
 
 // focusEntry is a multi-line Entry that tracks focus state and intercepts
 // Escape (to exit threads / cancel reply) and Ctrl shortcuts.
@@ -220,6 +358,13 @@ func (r *focusEntryRenderer) Refresh() {
 func clearStrokeRecursive(obj fyne.CanvasObject) {
 	if obj == nil {
 		return
+	}
+	if line, ok := obj.(*canvas.Line); ok {
+		if line.StrokeWidth != 0 || line.StrokeColor != color.Transparent {
+			line.StrokeWidth = 0
+			line.StrokeColor = color.Transparent
+			line.Refresh()
+		}
 	}
 	if rect, ok := obj.(*canvas.Rectangle); ok {
 		if rect.StrokeWidth != 0 || rect.StrokeColor != color.Transparent {
