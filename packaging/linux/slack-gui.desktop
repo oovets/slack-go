@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Slack GUI
+Comment=Lightweight Slack desktop client
+Exec=slack-gui
+Icon=slack-gui
+Terminal=false
+Categories=Network;InstantMessaging;
+StartupNotify=true

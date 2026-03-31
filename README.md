@@ -12,6 +12,21 @@ Standalone Slack desktop client built with Go and Fyne.
 - Go 1.24+
 - Slack token with scopes for conversations, history, posting, and users
 
+Recommended Slack scopes:
+
+- `channels:history`
+- `channels:read`
+- `groups:history`
+- `groups:read`
+- `im:history`
+- `im:read`
+- `mpim:history`
+- `mpim:read`
+- `chat:write`
+- `users:read`
+- `users:read.email` (optional)
+- `emoji:read` (optional, enables workspace emoji/reaction mapping)
+
 ## Configuration
 
 Credential priority:
@@ -46,6 +61,45 @@ go build -o slack-gui ./cmd/slack-gui
 
 Logs are written to `~/.slack-gui.log`.
 
+## Release Checklist
+
+```bash
+go fmt ./...
+go test ./...
+go build -o slack-gui ./cmd/slack-gui
+```
+
+Optional packaging build:
+
+```bash
+./packaging/linux/build.sh --version 0.1.0
+```
+
+Before tagging a release:
+
+- verify Slack token scopes (especially `emoji:read` if emoji mapping is desired)
+- run a quick smoke test: channel switch, message send, thread open, quick switcher
+- verify startup from a clean shell with only env vars (no editor-injected state)
+
+## Implementation Plan
+
+Current UI/UX and packaging roadmap lives in `PLAN.md`.
+
+## Linux Packaging
+
+Packaging assets and scripts are in `packaging/linux`.
+
+Build release artifacts:
+
+```bash
+./packaging/linux/build.sh --version 0.1.0
+```
+
+This can produce:
+- tar.gz bundle
+- AppImage (if `appimagetool` is installed)
+- `.deb` and `.rpm` (if `nfpm` is installed)
+
 ## Key Features
 
 - Channel list with search and unread indicators
@@ -71,3 +125,4 @@ Test window: 30s (warmup 5s, interval 1s)
 - `Ctrl+W` close focused pane
 - `Ctrl+S` toggle channel list
 - `Ctrl+N` open new window
+- `Ctrl+K` open quick switcher
