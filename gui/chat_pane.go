@@ -28,14 +28,12 @@ type chatPane struct {
 	input        *focusEntry
 	inputCard    *fyne.Container
 	inputTopGap  *canvas.Rectangle
-	inputGap     *canvas.Rectangle
 	inputVisible bool
 	revealAnim   *fyne.Animation
 	replyHolder  *fyne.Container
 	replyLabel   *widget.Label
 	threadHolder *fyne.Container
 	threadLabel  *widget.Label
-	hintLabel    *widget.Label
 
 	channelID   string
 	channelName string
@@ -81,8 +79,6 @@ func newChatPane(onActivate func(*chatPane), onSend func(*chatPane), onExitThrea
 	p.replyLabel.Wrapping = fyne.TextTruncate
 	p.threadLabel = widget.NewLabel("")
 	p.threadLabel.Wrapping = fyne.TextTruncate
-	p.hintLabel = widget.NewLabel("Enter to send  |  Shift+Enter for new line  |  Ctrl+K quick switch")
-	p.hintLabel.Importance = widget.LowImportance
 	p.threadBg = canvas.NewRectangle(theme.Color(theme.ColorNameHover))
 	p.replyBg = canvas.NewRectangle(theme.Color(theme.ColorNameHover))
 	p.threadHolder = container.NewMax(p.threadBg, container.NewPadded(container.NewBorder(nil, nil, nil, widget.NewButton("Leave thread", func() {
@@ -100,8 +96,6 @@ func newChatPane(onActivate func(*chatPane), onSend func(*chatPane), onExitThrea
 
 	p.inputTopGap = canvas.NewRectangle(color.Transparent)
 	p.inputTopGap.SetMinSize(fyne.NewSize(1, 8))
-	p.inputGap = canvas.NewRectangle(color.Transparent)
-	p.inputGap.SetMinSize(fyne.NewSize(1, 0))
 	p.inputBg = canvas.NewRectangle(color.Transparent)
 	p.inputBorder = canvas.NewRectangle(color.Transparent)
 	p.inputBorder.StrokeColor = color.Transparent
@@ -117,7 +111,7 @@ func newChatPane(onActivate func(*chatPane), onSend func(*chatPane), onExitThrea
 		p.inputBg,
 		container.NewBorder(inputTopPad, inputBottomPad, fixedWidthSpacer(inputHPad), fixedWidthSpacer(inputHPad), p.input),
 	)
-	p.inputCard = container.NewVBox(p.inputTopGap, p.threadHolder, p.replyHolder, entryRow, p.hintLabel, p.inputGap)
+	p.inputCard = container.NewVBox(p.inputTopGap, p.threadHolder, p.replyHolder, entryRow)
 	p.inputVisible = true
 	p.viewport = container.NewBorder(nil, p.inputCard, nil, nil, p.msgScroll)
 	p.viewport.Objects = []fyne.CanvasObject{p.msgScroll, p.inputCard}
@@ -209,7 +203,6 @@ func (p *chatPane) refreshForTheme() {
 	}
 	p.replyLabel.Refresh()
 	p.threadLabel.Refresh()
-	p.hintLabel.Refresh()
 	p.title.Refresh()
 	p.msgBox.Refresh()
 	p.panel.Refresh()
